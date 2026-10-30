@@ -2,7 +2,7 @@
 
 > 一款专为挂机游戏设计的 Windows 多开自动化工作站。实时预览、连点器、键盘宏、宏录制、多窗口同步执行、Steam 挂机游戏预设,一站搞定。
 
-![banner](https://img.shields.io/badge/version-1.6.5-blue)
+![banner](https://img.shields.io/badge/version-1.6.6-blue)
 ![platform](https://img.shields.io/badge/platform-Windows-blue)
 ![python](https://img.shields.io/badge/python-3.14+-green)
 ![license](https://img.shields.io/badge/license-MIT-green)
@@ -43,7 +43,9 @@ AutoFarmStation(多开挂机大师)是一款面向 **Steam 挂机游戏 / 放置
   - 也可以完全不勾选,只对某一个窗口单独配置、单独启停。
 - **连点器**:多点击点位轮询、可设随机抖动、左右中双击支持、可视化选点、每进程独立配置。
 - **键盘宏**:按键序列回放、持续按键、单键循环,任意组合。
-- **宏录制/回放**:录制鼠标 + 键盘轨迹,保存为可分享的 JSON,任意窗口回放。
+- **宏录制/回放**:录制鼠标 + 键盘轨迹,保存为 JSON,任意窗口回放。
+  录制默认只采「目标窗口在前台」期间的输入,并有 120 秒 / 2 万事件上限(到点自动停),
+  免得忘了按停止就变成全局按键记录 —— 详见「隐私」。
 - **Steam 状态联动**:开始挂机自动把 Steam 状态切到「在线 / 离开 / 隐身」,挂机停完自动还原;
   切换后回读本地配置确认生效。全程本地,不需要账号密码。
 - **窗口控制**:置顶、透明度、位置记忆,按进程独立配置。
@@ -109,6 +111,9 @@ AutoFarmStation(多开挂机大师)是一款面向 **Steam 挂机游戏 / 放置
 - `%APPDATA%\AutoFarmStation\macros\` — 用户录制的宏
 - `%APPDATA%\AutoFarmStation\presets\` — 用户自定义预设
 
+同一时间只能运行一个实例:第二个实例会提示「已经在运行了」并退出 —— 双开时两份进程
+各自保存配置,后保存的会把前一份的窗口列表/预设整个覆盖掉。
+
 ## 快速上手
 
 1. 启动你的挂机游戏(Melvor Idle / Clicker Heroes / Idle Slayer / 其他)。
@@ -152,10 +157,22 @@ AutoFarmStation(多开挂机大师)是一款面向 **Steam 挂机游戏 / 放置
 
 ## 隐私
 
-- **100% 本地运行**,所有数据保存在 `%APPDATA%\AutoFarmStation\`。
-- 日志/反馈上传前自动脱敏:Windows 用户名、游戏安装目录、AppData、TEMP、机器名一律替换为占位符。
-- UI 不显示 Windows 用户名,所有路径用 `%APPDATA%\...` / `%USERPROFILE%\...` 占位符展示。
-- **不上传任何数据**,更新检查只读取 GitHub releases。
+- **100% 本地运行**,所有数据保存在 `%APPDATA%\AutoFarmStation\`,不上传任何数据。
+- 联网只有两处:检查更新(读取 GitHub releases API)与「立即更新」下载 release 资产。
+  除此之外不产生任何外发请求。
+- 日志、UI 展示、日志导出一律脱敏:Windows 用户名、`%APPDATA%` / `%LOCALAPPDATA%` /
+  `%TEMP%` / 用户目录(反斜杠与正斜杠、大小写变体都覆盖)、机器名、UNC 路径、
+  以及**探测到的游戏安装目录**一律替换为占位符;`traceback` 也在写入前整行脱敏。
+- 「导出备份」里的 `config.json` / `session.json` **不脱敏** —— 恢复需要本机绝对路径,
+  脱敏了就导不回来。这份包适合自己在换机/重装时用,不要当成匿名附件发给别人。
+- 「立即更新」的完整链路是:校验下载地址属于本仓库 release → 下载 → 按发布时提供的
+  SHA-256 校验 → 退出时备份旧 exe 再覆盖 → 失败自动回滚。**拿不到校验值就拒绝自动更新**,
+  只给 release 页面链接。
+- **宏录制是系统级键盘/鼠标钩子**。为避免它变成键盘记录器,默认只采集「目标窗口在前台」
+  期间的输入,单次录制最长 120 秒 / 2 万事件,到点自动停止;不选目标窗口时会在开始前
+  明确警告并需要确认。
+- 设置 → 输入方式:可以关掉「允许真实输入(SendInput)回退」,或要求回退前必须确认
+  目标窗口已在前台 —— 后者默认开启,避免投递失败时把点击打到你自己正在用的窗口。
 
 ## 常见问题
 
@@ -192,10 +209,15 @@ A:实测 `offline` 走这个协议在当前 Steam 客户端不生效(状态不�
 ## 自检与开发
 
 ```bash
-python -m scripts.selftest   # 46 项自检(v1.6.5;v1.6.4 是 44 项,v1.6.3 是 40 项,v1.6.2 是 37 项,v1.6.1 是 31 项,v1.6.0 是 27 项)
-powershell -ExecutionPolicy Bypass -File scripts\build.ps1   # 打包(dist\AutoFarmStation.exe)
+python -m scripts.selftest   # 56 项自检(v1.6.6;v1.6.5 是 46 项,v1.6.4 是 44 项,v1.6.3 是 40 项,v1.6.2 是 37 项,v1.6.1 是 31 项)
+powershell -ExecutionPolicy Bypass -File scripts\build.ps1   # 打包(dist\AutoFarmStation.exe + AutoFarmStation.exe.sha256)
 powershell -ExecutionPolicy Bypass -File scripts\smoke_exe.ps1   # 启动冒烟(可选)
 ```
+
+发布时必须把 `AutoFarmStation.exe` 与同目录的 `AutoFarmStation.exe.sha256` **一起**传到
+同一个 release:软件的「立即更新」只认本仓库 release 下载地址,并且校验哈希 ——
+没有 sidecar 时它会拒绝自动更新,只给手动下载链接。有代码签名证书时设置
+`AFS_SIGN_PFX` / `AFS_SIGN_PASS`(或 `AFS_SIGN_CERT`)再跑一次构建即可自动签名并重算摘要。
 
 打包产物带 Windows 版本资源,右键「属性 → 详细信息」可看到版本;
 构建脚本会核对 `FileVersion` 与 `autofarmstation.__version__` 是否一致,不一致直接失败。
@@ -213,8 +235,9 @@ powershell -ExecutionPolicy Bypass -File scripts\smoke_exe.ps1   # 启动冒烟(
 
 ## 反馈
 
-应用内「帮助 → 反馈建议」一键前往 GitHub Issues。仓库:[github.com/zlwzk/AutoFarmStation](https://github.com/zlwzk/AutoFarmStation)
+应用内「帮助 → 反馈建议」一键前往 GitHub Issues。仓库:[github.com/coyn1983/AutoFarmStation](https://github.com/coyn1983/AutoFarmStation)
 
 ---
 
-完全本地运行,无需联网,无广告无追踪,放心挂机。
+完全本地运行:数据不出本机,无广告无追踪。联网仅用于检查更新与下载 release 资产
+(可在「设置 → 更新与日志」里关闭自动检查)。
