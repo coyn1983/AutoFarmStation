@@ -80,6 +80,10 @@ class FarmWindowGuard:
         # 跨天: [start, 24:00) ∪ [00:00, end)
         return cur >= pair.start or cur < pair.end
 
-    def should_block_start(self) -> bool:
-        """是否应该拒绝启动(启用且当前不在时段内)."""
-        return self.enabled and not self.in_window()
+    def should_block_start(self, now: datetime.datetime | None = None) -> bool:
+        """是否应该拒绝启动(启用且当前不在时段内).
+
+        ``now`` 只给自检用:不注入时间的话,这条断言会随真实钟表走到 08:00–18:00
+        之间而时成时败。
+        """
+        return self.enabled and not self.in_window(now)

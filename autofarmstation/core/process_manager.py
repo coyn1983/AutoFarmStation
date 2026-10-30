@@ -29,6 +29,9 @@ class TrackedProcess:
     added_at: float = field(default_factory=time.time)
     last_seen: float = field(default_factory=time.time)
     alive: bool = True
+    # 加入追踪时该 pid 的进程创建时间:结束进程前用来确认「还是同一个进程」
+    # (PID 会被 Windows 复用,长时间挂机后旧 pid 可能已属于别的进程,#12)
+    pid_create_time: float = 0.0
     tags: list[str] = field(default_factory=list)
     alias: str = ""  # 用户给这个窗口起的别名(多开时靠它分辨)
     color: str = ""  # 卡片强调色(十六进制,空 = 不强调)
@@ -43,6 +46,19 @@ class TrackedProcess:
     mem_mb: float = 0.0
 
     _RUNTIME_FIELDS = ("cpu", "mem_mb")
+
+    def __post_init__(self) -> None:
+        """新加的追踪项自动记下该 pid 的进程创建时间(#12 的前提).
+
+        老配置里没有这个值(0.0),这里按当前 pid 现取一次:虽然不能证明
+        「就是当初那个进程」,但至少比什么都没有强。
+        """
+        if not self.pid_create_time and self.pid:
+            try:
+                from .game_launcher import process_identity
+                self.pid_create_time = float(process_identity(int(self.pid))[0] or 0.0)
+            except Exception:  # noqa: BLE001
+                self.pid_create_time = 0.0
 
     def display_name(self) -> str:
         """卡片标题:别名优先,其次窗口标题,最后兜底进程名/PID."""
@@ -74,6 +90,7 @@ class TrackedProcess:
             added_at=float(d.get("added_at", time.time())),
             last_seen=float(d.get("last_seen", time.time())),
             alive=bool(d.get("alive", True)),
+            pid_create_time=float(d.get("pid_create_time", 0.0) or 0.0),
             tags=list(d.get("tags", []) or []),
             alias=str(d.get("alias", "") or ""),
             color=str(d.get("color", "") or ""),

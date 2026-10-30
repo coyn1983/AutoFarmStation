@@ -42,6 +42,10 @@ def _fail(name: str, e: Exception) -> None:
     traceback.print_exc(limit=3)
 
 
+def _skip(name: str, why: str) -> None:
+    print(f"  [SKIP] {name}:{why}")
+
+
 # === 测试用例 ===
 def t_paths() -> bool:
     _div("paths.py")
@@ -1245,7 +1249,7 @@ def t_farm_window_guard() -> bool:
         assert not g.in_window(morning)
         assert g.in_window(noon)
         assert not g.in_window(evening)
-        assert g.should_block_start(), "不在时段应返回 True"
+        assert g.should_block_start(morning), "不在时段应返回 True(注入固定时刻,别随真实钟表漂移)"
 
         # 3) 跨天:start=22:00, end=08:00
         cfg.set("farm_window.start", "22:00")
@@ -1971,6 +1975,12 @@ def run_all() -> int:
                                                                 t_bat_drag_import_is_bat_url_matrix,
                                                                 t_bat_pick_files_calls_import_paths,
                                         ]
+    # 代码风险审计报告(#1–#15)对应的回归用例
+    try:
+        from scripts.selftest_audit import TESTS as AUDIT_TESTS
+        tests = list(tests) + list(AUDIT_TESTS)
+    except Exception as e:  # noqa: BLE001
+        _fail("加载审计用例", e)
     passed = 0
     failed = 0
     for t in tests:
