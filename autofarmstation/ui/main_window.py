@@ -7,7 +7,7 @@ import threading
 import time
 import webbrowser
 
-from PySide6.QtCore import Qt, QTimer, QSize
+from PySide6.QtCore import Qt, Signal, QTimer, QSize
 from PySide6.QtGui import QAction, QKeySequence, QShortcut, QIcon
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QSplitter, QMenuBar,
@@ -81,21 +81,32 @@ class GlobalHotkeyWatcher:
         self._listener = None
 
     def _fire(self, name: str) -> None:
-        cb = self._callbacks.get(name)
-        if cb:
-            try:
-                cb()
-            except Exception as e:
-                self._log.warning("热键回调出错: %s", e)
+        with self._lock:
+            cb = self._callbacks.get(name)
+        if cb is None:
+            return
+        try:
+            cb()
+        except Exception as e:
+            self._log.warning("热键回调出错: %s", e)
 
 
 class MainWindow(QMainWindow):
     """主窗口."""
 
+    # 通用的「工作线程 → 主线程」投递通道(#1 / #5)。
+    # 为什么不能用 QTimer.singleShot(0, lambda):不带 context 对象的 singleShot
+    # 把定时器建立在**调用它的线程**上,而 Python 的 threading.Thread 没有 Qt
+    # 事件循环,回调永不执行(闭包连同它捕获的大缓冲会被长期持有)。
+    # Signal + queued connection 才是可行路径(实测有效)。
+    ui_call = Signal(object)
+
     def __init__(self, *, verbose: bool = False) -> None:
         super().__init__()
         self._log = get()
         self._cfg = cfg_mod.instance()
+        # 跨线程投递通道必须先接好:后面的监控/调度/热键线程都靠它回主线程(#1/#5)
+        self.ui_call.connect(self._run_on_ui)
         self._log.setLevel(self._cfg.get("settings.log_level", "INFO") if not verbose else "DEBUG")
 
         # 核心
@@ -135,26 +146,46 @@ class MainWindow(QMainWindow):
         self._pm.on_change(self._on_pm_change)
 
         # 全局热键
+        # 回调运行在 pynput 的键盘钩子线程里,绝不能直接碰 Qt 对象 —— 只做一件事:
+        # 把动作投递到主线程(#5)。急停路径因此也不会被 join 卡住钩子线程。
         self._hotkeys = GlobalHotkeyWatcher(logger=self._log)
-        self._hotkeys.register("start_all", self._on_hotkey_start_all)
-        self._hotkeys.register("stop_all", self._on_hotkey_stop_all)
-        self._hotkeys.register("panic", self._on_hotkey_panic)
+        self._hotkeys.register(
+            "start_all", lambda: self._post_to_ui(self._on_hotkey_start_all))
+        self._hotkeys.register(
+            "stop_all", lambda: self._post_to_ui(self._on_hotkey_stop_all))
+        self._hotkeys.register(
+            "panic", lambda: self._post_to_ui(self._on_hotkey_panic))
         self._hotkeys.start()
 
-        # 调度 handlers
-        self._sched.register_handler("start_all", lambda t: self._on_hotkey_start_all())
-        self._sched.register_handler("stop_all", lambda t: self._on_hotkey_stop_all())
-        self._sched.register_handler("launch_games", lambda t: self._launch_games_scheduled(t))
-        self._sched.register_handler("kill_games", lambda t: self._kill_games_scheduled(t))
-        self._sched.register_handler("start_clicker", lambda t: self._clicker_scheduled(t, True))
-        self._sched.register_handler("stop_clicker", lambda t: self._clicker_scheduled(t, False))
-        self._sched.register_handler("play_macro", lambda t: self._play_macro_scheduled(t))
+        # 调度 handlers(同样跑在调度线程,统一走主线程)
+        self._sched.register_handler(
+            "start_all", lambda t: self._post_to_ui(self._on_hotkey_start_all))
+        self._sched.register_handler(
+            "stop_all", lambda t: self._post_to_ui(self._on_hotkey_stop_all))
+        self._sched.register_handler(
+            "launch_games", lambda t: self._post_to_ui(
+                lambda: self._launch_games_scheduled(t)))
+        self._sched.register_handler(
+            "kill_games", lambda t: self._post_to_ui(
+                lambda: self._kill_games_scheduled(t)))
+        self._sched.register_handler(
+            "start_clicker", lambda t: self._post_to_ui(
+                lambda: self._clicker_scheduled(t, True)))
+        self._sched.register_handler(
+            "stop_clicker", lambda t: self._post_to_ui(
+                lambda: self._clicker_scheduled(t, False)))
+        self._sched.register_handler(
+            "play_macro", lambda t: self._post_to_ui(
+                lambda: self._play_macro_scheduled(t)))
         # 音量动作只作用于「已加入本软件的窗口」,绝不碰系统总音量 ——
         # 定时「静音」不该顺手把用户的 QQ / 视频也静掉。
-        self._sched.register_handler("volume_low", lambda t: self._group_volume_set(0.2))
-        self._sched.register_handler("volume_mute", lambda t: self._group_mute_set(True))
-        self._sched.register_handler("volume_restore", lambda t: self._group_volume_restore())
-        self._sched.register_handler("shutdown_app", lambda t: self.close())
+        self._sched.register_handler(
+            "volume_low", lambda t: self._post_to_ui(lambda: self._group_volume_set(0.2)))
+        self._sched.register_handler(
+            "volume_mute", lambda t: self._post_to_ui(lambda: self._group_mute_set(True)))
+        self._sched.register_handler(
+            "volume_restore", lambda t: self._post_to_ui(self._group_volume_restore))
+        self._sched.register_handler("shutdown_app", lambda t: self._post_to_ui(self.close))
         self._sched.start()
         self._monitor.start()
 
@@ -180,6 +211,17 @@ class MainWindow(QMainWindow):
 
         # 加载持久化
         self._load_state()
+        # 上次崩溃 / 被强杀留下的嵌入窗口:回放 journal 把它们还原(#7)
+        try:
+            from ..core import window_host
+            window_host.recover_embedded_windows(self._log)
+        except Exception as e:  # noqa: BLE001
+            self._log.warning("嵌入状态 journal 回放失败:%s", e)
+        # 配置文件损坏过 → 明确告诉用户,而不是静默重建后让人以为「窗口和预设全没了」(#Low)
+        _cfg_err = str(getattr(self._cfg, "load_error", "") or "")
+        if _cfg_err:
+            QTimer.singleShot(
+                1200, lambda: QMessageBox.warning(self, "配置已重建", _cfg_err))
         # 跨启动的窗口快照(独立于 config):启动后弹框问是否恢复上次窗口
         self._session = Session()
         self._restore_asked = False
@@ -217,6 +259,24 @@ class MainWindow(QMainWindow):
         # 退出时保存
         self._saved = False
 
+    # --- 跨线程投递(#1 / #5)---
+    def _post_to_ui(self, fn) -> None:
+        """从任意线程把一段只做 UI 操作的可调用对象排队到主线程执行."""
+        try:
+            self.ui_call.emit(fn)
+        except RuntimeError:
+            # 窗口已销毁(退出竞态):静默丢弃,不能让工作线程因此崩
+            pass
+        except Exception as e:  # noqa: BLE001
+            self._log.warning("投递主线程任务失败: %s", e)
+
+    def _run_on_ui(self, fn) -> None:
+        """主线程里执行投递过来的可调用对象."""
+        try:
+            fn()
+        except Exception as e:  # noqa: BLE001
+            self._log.warning("主线程回调出错: %s", e)
+
     # --- 显示:启动时最小化(只在第一次 show 触发一次) ---
     def showEvent(self, ev) -> None:  # noqa: D401
         super().showEvent(ev)
@@ -242,6 +302,17 @@ class MainWindow(QMainWindow):
                     self._save_state()
                 except Exception:  # noqa: BLE001
                     pass
+                # 更新重启同样要先还原嵌入窗口、停掉自动化 —— 否则新进程起来之前,
+                # 游戏窗口会挂在即将死掉的父窗口上(#7;journal 只是兜底,不是方案)
+                self._cleaned = True  # 这两步做完,别让后面的 closeEvent 再走一遍
+                for name, fn in (("停止自动化", self._hub.stop_all),
+                                 ("还原嵌入窗口", self._release_embedded_windows),
+                                 ("摘除热键钩子", self._hotkeys.stop),
+                                 ("还原音量快照", self._restore_volume_snapshot)):
+                    try:
+                        fn()
+                    except Exception as e:  # noqa: BLE001
+                        self._log.warning("更新退出前的「%s」失败:%s", name, e)
                 self._log.info("正在退出以便更新...")
                 ev.accept()
                 super().closeEvent(ev)
@@ -262,28 +333,63 @@ class MainWindow(QMainWindow):
             if r != QMessageBox.StandardButton.Yes:
                 ev.ignore()
                 return
-        self._save_state()
-        try:
-            self._steam.shutdown()
-            self._hub.stop_all()
-            self._monitor.stop()
-            self._sched.stop()
-            self._hotkeys.stop()
-            self._stats.on_session_end()
-            self._stats.save()
-        except Exception:
-            pass
-        # 还原所有嵌入窗口,避免退出后游戏窗口跟着消失
-        try:
-            from ..core import window_host
-            window_host.release_all()
-        except Exception:
-            pass
+        # 清理链:每一步单独兜底,一断不再全断(#7)。旧写法把「存状态」放在 try 之外,
+        # 再把 7 个清理步骤挤进同一个 try/except: pass —— 第一步抛异常,后面全部跳过
+        # 且日志里什么都看不出来,于是嵌入窗口没还原、热键钩子没摘、统计没落盘。
+        self._run_cleanup_once()
         # 关闭被追踪的游戏进程(可在设置里关掉)
         if close_games and pids:
-            n = self._kill_pids(pids, reason="退出软件")
-            self._log.info("退出时结束了 %d/%d 个游戏进程", n, len(pids))
+            try:
+                n = self._kill_pids(pids, reason="退出软件")
+                self._log.info("退出时结束了 %d/%d 个游戏进程", n, len(pids))
+            except Exception as e:  # noqa: BLE001
+                self._log.warning("退出时结束游戏进程失败: %s", e)
         super().closeEvent(ev)
+
+    def _run_cleanup_once(self) -> None:
+        """退出清理:幂等、逐步容错、每步都记日志(#7)."""
+        if getattr(self, "_cleaned", False):
+            return
+        self._cleaned = True
+        steps: list[tuple[str, callable]] = [
+            ("保存状态", self._save_state),
+            ("还原音量快照", self._restore_volume_snapshot),
+            ("Steam 状态", self._steam.shutdown),
+            ("停止自动化", self._hub.stop_all),
+            ("停止监控", self._monitor.stop),
+            ("停止调度", self._sched.stop),
+            ("摘除热键钩子", self._hotkeys.stop),
+            ("统计落盘", self._stats_finish),
+            ("还原嵌入窗口", self._release_embedded_windows),
+        ]
+        for name, fn in steps:
+            try:
+                fn()
+            except Exception as e:  # noqa: BLE001
+                # 单步失败不能带走整条链,但必须留下能排查的日志
+                self._log.warning("退出清理「%s」失败:%s", name, e)
+
+    def _stats_finish(self) -> None:
+        self._stats.on_session_end()
+        self._stats.save()
+
+    def _release_embedded_windows(self) -> None:
+        """还原所有嵌入窗口,避免退出后游戏窗口跟着消失."""
+        from ..core import window_host
+        n = window_host.release_all()
+        if n:
+            self._log.info("退出时还原了 %d 个嵌入窗口", n)
+
+    def _restore_volume_snapshot(self) -> None:
+        """退出时还原「定时静音 / 降音量」前的快照(#7).
+
+        不还原的话,软件都关了,用户的窗口还留在被静音的状态里。
+        """
+        if not self._volume_backup or not audio.available():
+            return
+        n = audio.restore_for_pids(self._volume_backup)
+        self._volume_backup = {}
+        self._log.info("退出时还原了 %d 个窗口的音量", n)
 
     # --- 进程结束 / 唤醒 ---
     def _tracked_pids(self) -> list[int]:
@@ -295,18 +401,41 @@ class MainWindow(QMainWindow):
         return out
 
     def _kill_pids(self, pids, *, reason: str = "") -> int:
+        """按 pid 结束进程树.
+
+        动手前用追踪项里记下的「进程名 + 创建时间」校验这个 pid 还是不是当初
+        那个进程 —— PID 会被 Windows 复用,长时间挂机后旧 pid 可能已属于别的
+        进程(甚至系统进程),而 `launch.close_games_on_exit` 默认开着,退出即执行(#12)。
+        """
+        from ..utils.sanitize import sanitize
+
         tree = bool(self._cfg.get("launch.kill_tree", True))
-        n = 0
-        for pid in list(pids):
+        identity: dict[int, tuple[str, float]] = {}
+        for tp in self._pm.all():
             try:
-                ok, _msg = kill_process(int(pid), tree=tree)
+                pid = int(tp.pid or 0)
+            except (TypeError, ValueError):
+                continue
+            if pid:
+                identity.setdefault(pid, (str(tp.name or ""), float(tp.pid_create_time or 0.0)))
+        wanted = list(pids)
+        n = 0
+        for pid in wanted:
+            name, ctime = identity.get(int(pid), ("", 0.0))
+            try:
+                ok, msg = kill_process(
+                    int(pid), tree=tree,
+                    expect_name=name, expect_create_time=ctime,
+                )
             except Exception as e:  # noqa: BLE001
                 self._log.warning("结束进程 %s 失败: %s", pid, e)
                 continue
             if ok:
                 n += 1
+            elif msg:
+                self._log.warning("PID %s 未结束:%s", pid, sanitize(msg))
         if reason:
-            self._log.info("已结束 %d/%d 个进程(%s)", n, len(list(pids)), reason)
+            self._log.info("已结束 %d/%d 个进程(%s)", n, len(wanted), reason)
         return n
 
     def _remember_launch(self, hwnd: int, pid: int = 0, title: str = "") -> None:
@@ -382,7 +511,8 @@ class MainWindow(QMainWindow):
         )
 
         def _done(ok: bool, msg: str) -> None:
-            QTimer.singleShot(0, lambda: self._after_resume(hwnd, li, ok, msg, silent))
+            # 唤醒线程 → 主线程:必须用 Signal,singleShot 在这里永不触发(#1)
+            self._post_to_ui(lambda: self._after_resume(hwnd, li, ok, msg, silent))
 
         launch_async(li, steam_timeout=timeout, on_done=_done)
 
@@ -459,6 +589,7 @@ class MainWindow(QMainWindow):
         except Exception:  # noqa: BLE001
             pass
         self._restart_hist.pop(int(old_hwnd), None)
+        self._stats.forget(int(old_hwnd))
         tp = self._pm.add_by_hwnd(win.hwnd)
         if tp is None:
             return
@@ -513,9 +644,9 @@ class MainWindow(QMainWindow):
         return done
 
     def _on_monitor_event(self, ev: MonitorEvent) -> None:
-        """监控线程发来的事件(可能在非 UI 线程,统一切回主线程处理)."""
+        """监控线程发来的事件(在非 UI 线程),用 Signal 切回主线程处理(#1/#5)."""
         try:
-            QTimer.singleShot(0, lambda: self._handle_monitor_event(ev))
+            self._post_to_ui(lambda: self._handle_monitor_event(ev))
         except Exception:  # noqa: BLE001
             pass
 
@@ -938,6 +1069,7 @@ class MainWindow(QMainWindow):
     def _on_close_from_preview(self, hwnd: int) -> None:
         self._hub.forget(hwnd)
         self._pm.remove(hwnd)
+        self._stats.forget(int(hwnd))  # 每进程统计按窗口回收,别只靠 rebind(#15)
         self._save_state()
 
     def _on_autoclick_toggle_from_preview(self, hwnd: int) -> None:
@@ -1253,7 +1385,9 @@ class MainWindow(QMainWindow):
 
     def _on_hotkey_stop_all(self) -> None:
         try:
-            self._hub.stop_all()
+            # 不在调用线程里逐个 join(多个窗口时会让界面/钩子干等好几秒,#5):
+            # 实例一被摘掉,卡片状态立刻变灰,线程在后台自行收尾。
+            self._hub.stop_all_async()
             self._right.stop_all()
             self._statusBar().showMessage("已停止全部", 2000)  # type: ignore[union-attr]
         except Exception as e:
@@ -1261,13 +1395,18 @@ class MainWindow(QMainWindow):
 
     def _on_hotkey_panic(self) -> None:
         try:
-            self._hub.stop_all()
+            self._hub.stop_all_async()
             self._right.stop_all()
             self._sched.stop()
             self._monitor.stop()
             self._statusBar().showMessage("急停:全部停止", 3000)  # type: ignore[union-attr]
-        except Exception:
-            pass
+        except Exception as e:  # noqa: BLE001
+            # 急停是最该可靠的路径,失败了也必须让用户看到
+            self._log.warning("急停失败:%s", e)
+            try:
+                self._statusBar().showMessage("急停未完成,请查看日志", 5000)  # type: ignore[union-attr]
+            except Exception:  # noqa: BLE001
+                pass
 
     # --- 工具栏 ---
     def _on_cols_changed(self, idx: int) -> None:
@@ -1463,8 +1602,8 @@ class MainWindow(QMainWindow):
             launch_async(
                 li,
                 steam_timeout=timeout,
-                on_done=lambda ok, msg, _li=li: QTimer.singleShot(
-                    0, lambda: self._after_wake(_li, ok, msg)
+                on_done=lambda ok, msg, _li=li: self._post_to_ui(
+                    lambda: self._after_wake(_li, ok, msg)
                 ),
             )
 
@@ -1584,8 +1723,9 @@ class MainWindow(QMainWindow):
     def _do_update_check(self, *, show_dialog: bool) -> None:
         def worker():
             info: UpdateInfo = check_update()
-            # 切回主线程
-            QTimer.singleShot(0, lambda: self._on_update_done(info, show_dialog))
+            # 切回主线程(旧写法用 QTimer.singleShot,在工作线程里永不触发,
+            # 于是「自动检查到新版本」的横幅从来不会出现 —— #1)
+            self._post_to_ui(lambda: self._on_update_done(info, show_dialog))
 
         threading.Thread(target=worker, daemon=True, name="UpdateCheck").start()
 

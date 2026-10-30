@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import threading
 import time
 
 from PySide6.QtCore import Qt, Signal, QTimer, QEvent
@@ -49,6 +50,10 @@ class PreviewWidget(QFrame):
     stop_process = Signal(int)  # hwnd → 结束该游戏进程
     resume_process = Signal(int)  # hwnd → 重新唤醒该游戏
     volume_requested = Signal(int)  # hwnd → 打开单窗口音量面板
+    # 内部:采集线程 → 主线程的投递通道。
+    # 必须用 Signal(queued connection),不能用 QTimer.singleShot —— 后者
+    # 把定时器建立在调用线程上,而 Python 工作线程没有 Qt 事件循环,永不触发。
+    frame_ready = Signal()
 
     def __init__(
         self,
@@ -70,6 +75,11 @@ class PreviewWidget(QFrame):
         self.setMinimumSize(int(cw), int(ch))
         self._capture = PreviewCapture(self.hwnd, fps=fps, phase=phase)
         self._capture.on_frame = self._on_frame
+        # 待渲染帧:采集线程只写最新一帧(天然丢弃过期帧),主线程取走后置空。
+        # 这样即使主线程一时忙不过来,内存里也最多滞留一帧缓冲。
+        self._pending_frame: PreviewFrame | None = None
+        self._frame_lock = threading.Lock()
+        self.frame_ready.connect(self._consume_frame)
         self._autoclicker_running = False
         self._fps = fps
         self._status_extra = ""
@@ -361,7 +371,12 @@ class PreviewWidget(QFrame):
     def stop(self) -> None:
         """卡片销毁前调用:必须先还原嵌入窗口,再停截图."""
         self._release_embed(quiet=True)
+        # 断开回调 + 丢掉待渲染帧:否则采集线程停止前的最后一帧仍会带着
+        # 8MB 缓冲投递到一张已经不在界面上的卡片(#1 的泄漏面)
+        self._capture.on_frame = None
         self._capture.stop()
+        with self._frame_lock:
+            self._pending_frame = None
         self._refresh_timer.stop()
 
     # --- 嵌入 ---
@@ -430,8 +445,24 @@ class PreviewWidget(QFrame):
         self.selection_changed.emit(self.hwnd, bool(on))
 
     def _on_frame(self, frame: PreviewFrame) -> None:
-        """截图回调(子线程).用 QTimer.singleShot 切到主线程."""
-        QTimer.singleShot(0, lambda: self._render_frame(frame))
+        """截图回调(采集线程).
+
+        不能在这里用 QTimer.singleShot 切线程:不带 context 的 singleShot
+        把定时器建立在**调用线程**上,Python 线程没有 Qt 事件循环 → 回调永不执行,
+        而每帧 lambda 连同 pixels(1080p ≈ 8.3 MB)会被长期持有。
+        这里只保留最新一帧,再由 Qt 信号以 queued connection 投递到主线程。
+        """
+        with self._frame_lock:
+            self._pending_frame = frame
+        self.frame_ready.emit()
+
+    def _consume_frame(self) -> None:
+        """主线程:取走最新待渲染帧并绘制."""
+        with self._frame_lock:
+            frame, self._pending_frame = self._pending_frame, None
+        if frame is None:
+            return
+        self._render_frame(frame)
 
     def _render_frame(self, frame: PreviewFrame) -> None:
         if self._embedded:

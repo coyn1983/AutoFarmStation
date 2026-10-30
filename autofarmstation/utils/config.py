@@ -62,6 +62,24 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "skipped_version": "",  # 用户点过「稍后」跳过的版本,不再提示
         "auto_start_windows": False,
         "log_level": "INFO",
+        # 「立即更新」下载完待替换的 exe / 目标路径 / 期望 SHA-256(#3)
+        "pending_update_path": "",
+        "pending_update_target_exe": "",
+        "pending_update_sha256": "",
+    },
+    # 输入投递策略
+    "input": {
+        # 允许「真实输入」(SendInput)。关掉后 post 失败就只是失败,
+        # 绝不会把点击/按键打到用户当前正在用的窗口上(#4)
+        "allow_real_fallback": True,
+        # 真实输入回退前是否必须确认目标窗口已在前台(默认必须,#4)
+        "require_foreground": True,
+    },
+    # 宏录制隐私边界(#2)
+    "macro": {
+        "record_only_foreground": True,   # 只在目标窗口前台时采集输入
+        "max_record_seconds": 120,        # 单次录制最长时长,到点自动停
+        "max_record_events": 20000,       # 单次录制事件数上限
     },
     # 游戏进程的启动/结束策略
     "launch": {
@@ -154,25 +172,41 @@ class Config:
         self._lock = threading.RLock()
         self._path = path or config_path()
         self._data: dict[str, Any] = copy.deepcopy(DEFAULT_CONFIG)
+        # 上一次 load() 是否遇到过损坏配置(界面据此提示用户,别再静默重建,#Low)
+        self.load_error: str = ""
         self.load()
 
     # --- I/O ---
     def load(self) -> None:
         with self._lock:
+            self.load_error = ""
             if not self._path.exists():
                 self._data = copy.deepcopy(DEFAULT_CONFIG)
                 return
             try:
                 with open(self._path, "r", encoding="utf-8") as f:
                     raw = json.load(f)
-            except Exception:
-                # 配置文件损坏时,保留损坏副本并重建
+            except Exception as e:  # noqa: BLE001
+                # 配置文件损坏时,保留损坏副本并重建 —— 但必须留下痕迹:
+                # 「我的窗口和预设全没了」如果静默发生,用户只会以为软件吞了数据。
+                bad_name = ""
                 try:
                     bad = self._path.with_suffix(".corrupt.json")
                     self._path.rename(bad)
-                except Exception:
+                    bad_name = bad.name
+                except Exception:  # noqa: BLE001
                     pass
                 self._data = copy.deepcopy(DEFAULT_CONFIG)
+                self.load_error = (
+                    f"配置文件无法读取({type(e).__name__}),"
+                    + (f"损坏副本已另存为 {bad_name}," if bad_name else "原文件已不可用,")
+                    + "窗口列表 / 预设 / 设置已重建为默认值。"
+                )
+                try:
+                    from .logger import get
+                    get().error("%s", self.load_error)
+                except Exception:  # noqa: BLE001
+                    pass
                 return
             self._data = self._merge_with_defaults(migrate_legacy(raw))
 

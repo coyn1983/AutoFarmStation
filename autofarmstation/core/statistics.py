@@ -37,6 +37,11 @@ class Stats:
 class Statistics:
     """线程安全的统计管理器."""
 
+    # per_process 以 hwnd 为键,而 hwnd 每开一次游戏就是一个新值:不回收的话
+    # stats.json 会随挂机周数单调增长(#15)。
+    MAX_PER_PROCESS = 256
+    PER_PROCESS_MAX_AGE_SEC = 30 * 24 * 3600
+
     def __init__(self, path: Path | None = None) -> None:
         self._lock = threading.RLock()
         self._path = path or stats_path()
@@ -70,7 +75,42 @@ class Statistics:
 
     def save(self) -> None:
         with self._lock:
+            self._prune_per_process()
             atomic_write(self._path, json.dumps(asdict(self._data), indent=2, ensure_ascii=False))
+
+    # --- 每进程记录的回收(#15)---
+    def _bump(self, hwnd: int) -> dict:
+        k = str(int(hwnd))
+        rec = self._data.per_process.setdefault(
+            k, {"clicks": 0, "keys": 0, "runtime_ms": 0, "last_seen": 0.0})
+        rec["last_seen"] = time.time()
+        return rec
+
+    def forget(self, hwnd: int) -> None:
+        """窗口被移除时清掉它的每进程统计."""
+        with self._lock:
+            self._data.per_process.pop(str(int(hwnd)), None)
+
+    def _prune_per_process(self) -> None:
+        """丢掉长期没再出现过的窗口记录,并给总量封顶."""
+        now = time.time()
+        items = self._data.per_process
+        stale = [
+            k for k, v in items.items()
+            if now - float(v.get("last_seen", 0.0) or 0.0) > self.PER_PROCESS_MAX_AGE_SEC
+        ]
+        for k in stale:
+            items.pop(k, None)
+        if len(items) <= self.MAX_PER_PROCESS:
+            return
+        # 还超上限:按最近使用时间保留前 MAX_PER_PROCESS 个
+        ordered = sorted(
+            items.items(),
+            key=lambda kv: float(kv[1].get("last_seen", 0.0) or 0.0),
+            reverse=True,
+        )
+        keep = dict(ordered[: self.MAX_PER_PROCESS])
+        self._data.per_process = keep
 
     # --- 累加 ---
     def on_session_start(self) -> None:
@@ -89,24 +129,21 @@ class Statistics:
         with self._lock:
             self._data.total_clicks += max(0, count)
             if hwnd:
-                k = str(hwnd)
-                rec = self._data.per_process.setdefault(k, {"clicks": 0, "keys": 0, "runtime_ms": 0})
+                rec = self._bump(hwnd)
                 rec["clicks"] = rec.get("clicks", 0) + max(0, count)
 
     def add_key(self, count: int = 1, hwnd: int = 0) -> None:
         with self._lock:
             self._data.total_keys += max(0, count)
             if hwnd:
-                k = str(hwnd)
-                rec = self._data.per_process.setdefault(k, {"clicks": 0, "keys": 0, "runtime_ms": 0})
+                rec = self._bump(hwnd)
                 rec["keys"] = rec.get("keys", 0) + max(0, count)
 
     def add_runtime(self, ms: int, hwnd: int = 0) -> None:
         with self._lock:
             self._data.total_runtime_ms += max(0, ms)
             if hwnd:
-                k = str(hwnd)
-                rec = self._data.per_process.setdefault(k, {"clicks": 0, "keys": 0, "runtime_ms": 0})
+                rec = self._bump(hwnd)
                 rec["runtime_ms"] = rec.get("runtime_ms", 0) + max(0, ms)
 
     # --- 访问 ---

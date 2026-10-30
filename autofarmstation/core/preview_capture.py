@@ -221,6 +221,21 @@ class PreviewCapture:
         if self._thread:
             self._thread.join(timeout=1.5)
         self._thread = None
+        # mss 持有屏幕 DC,从不 close 就是每重建/销毁一次卡片漏一个句柄(#15)
+        self._close_mss()
+
+    def _close_mss(self) -> None:
+        mss_inst, self._mss = self._mss, None
+        if mss_inst is None:
+            return
+        for closer in ("close", "_close"):
+            fn = getattr(mss_inst, closer, None)
+            if callable(fn):
+                try:
+                    fn()
+                    return
+                except Exception:  # noqa: BLE001
+                    pass
 
     def capture_once(self) -> PreviewFrame | None:
         """主动截一帧(忽略 FPS 节流)."""

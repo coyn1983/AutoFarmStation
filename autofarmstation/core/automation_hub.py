@@ -190,6 +190,32 @@ class AutomationHub:
         for h in hwnds:
             self.stop(h)
 
+    def stop_all_async(self, *, join_budget_sec: float = 3.0) -> None:
+        """在独立工作线程里逐个停,调用方(主线程 / 热键钩子线程)立刻返回(#5).
+
+        旧实现让 pynput 钩子线程顺序 `join()` 每个连点线程(每个最多 1 s),
+        多窗口急停时钩子线程被卡住,后续按键(包括再次按停)全丢 —— 最该可靠
+        的路径最脆。这里线程实例一被 `stop()` 就从注册表里摘掉,所以 UI 的
+        「运行中」状态是立即变灰的,不受 join 快慢影响。
+        """
+        def _work() -> None:
+            t0 = time.time()
+            with self._lock:
+                hwnds = list(set(self._clickers) | set(self._macros))
+            for h in hwnds:
+                if time.time() - t0 > join_budget_sec:
+                    self._log.warning(
+                        "批量停止超出预算 %.1fs,剩余 %d 个线程自行收尾",
+                        join_budget_sec, len(hwnds),
+                    )
+                    break
+                try:
+                    self.stop(h)
+                except Exception as e:  # noqa: BLE001
+                    self._log.warning("停止 hwnd=%s 失败: %s", h, e)
+
+        threading.Thread(target=_work, name="HubStopAll", daemon=True).start()
+
     # ---------- 批量启停(同步执行) ----------
     def start_many(self, hwnds: list[int], *, clicker: bool = True,
                    key_macro: bool = True) -> BundleResult:
@@ -248,10 +274,13 @@ class AutomationHub:
         parts = []
         if c and c.is_running:
             tag = "暂停" if c.is_paused else "连点"
+            if c.window_hidden:
+                tag = "等待窗口"  # 隐藏/最小化中,没停(#8)
             sec = int(c.runtime_seconds)
             parts.append(f"{tag} {sec // 60:02d}:{sec % 60:02d} ({c.click_count})")
         if m and m.is_running:
-            parts.append(f"宏 {m.rounds} 轮")
+            tag = "等待窗口" if m.window_hidden else "宏"
+            parts.append(f"{tag} {m.rounds} 轮")
         return " · ".join(parts)
 
     def has_config(self, hwnd: int) -> bool:

@@ -81,7 +81,22 @@ def run(argv: list[str], version: str) -> int:
     from PySide6.QtCore import Qt
     QApplication.setAttribute(Qt.ApplicationAttribute.AA_EnableHighDpiScaling, True)
 
+    # 单实例互斥(#9):两份进程同时保存配置就是 last-writer-wins,
+    # 后写的会把前一份的窗口列表 / 预设 / 定时任务整个覆盖掉。
+    from .utils.paths import acquire_single_instance
+    already_running = not acquire_single_instance(__app_name__)
+
     app = QApplication(argv)
+    if already_running:
+        log.warning("检测到已有实例在运行,本次启动取消")
+        from PySide6.QtWidgets import QMessageBox
+        QMessageBox.warning(
+            None, __app_name_cn__,
+            f"{__app_name_cn__} 已经在运行了。\n\n"
+            "同时开两份会互相覆盖配置和窗口列表(后保存的赢),"
+            "请回到已经打开的那个窗口操作。",
+        )
+        return 1
     app.setApplicationName(__app_name__)
     app.setApplicationDisplayName(__app_name_cn__)
     app.setApplicationVersion(version)

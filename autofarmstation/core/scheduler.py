@@ -204,6 +204,9 @@ class Scheduler:
         self._handlers: dict[str, Callable[[ScheduledTask], None]] = {}
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        # 延时任务用的 threading.Timer 登记处:stop()/clear() 必须能把它们取消,
+        # 否则「延时 300s 停止游戏」会在软件退出后照样触发(#6)
+        self._timers: set[threading.Timer] = set()
         self._path = path or schedule_path()
         self._autosave = autosave
         self.load()
@@ -310,6 +313,7 @@ class Scheduler:
             return self._tasks.get(name)
 
     def clear(self) -> None:
+        self._cancel_timers()
         with self._lock:
             self._tasks.clear()
             self._order.clear()
@@ -325,9 +329,26 @@ class Scheduler:
 
     def stop(self) -> None:
         self._stop.set()
+        self._cancel_timers()
         if self._thread:
             self._thread.join(timeout=2.0)
         self._thread = None
+
+    def _cancel_timers(self) -> int:
+        """取消所有还没触发的延时任务(#6)."""
+        with self._lock:
+            timers = list(self._timers)
+            self._timers.clear()
+        n = 0
+        for t in timers:
+            try:
+                t.cancel()
+                n += 1
+            except Exception:  # noqa: BLE001
+                pass
+        if n:
+            self._log.info("已取消 %d 个未触发的延时任务", n)
+        return n
 
     def run_now(self, name: str) -> bool:
         """立刻执行一次(不影响下次排期,ONCE 也会保留)."""
@@ -402,8 +423,10 @@ class Scheduler:
                         self._log.info("定时任务延时 %d 秒执行: %s",
                                        int(t.delay_sec), sanitize(t.name))
                         timer = threading.Timer(
-                            float(t.delay_sec), self._invoke_safe, args=(t,))
+                            max(1.0, float(t.delay_sec)), self._invoke_safe, args=(t,))
                         timer.daemon = True
+                        with self._lock:
+                            self._timers.add(timer)
                         timer.start()
                     else:
                         self._invoke(t)
@@ -419,6 +442,14 @@ class Scheduler:
 
     def _invoke_safe(self, t: ScheduledTask) -> None:
         """延时线程的入口:自己吞掉异常,免得线程把堆栈打到控制台."""
+        # 从登记表里摘掉当前这个 Timer(threading.Timer 触发时正跑在自己的线程里)
+        me = threading.current_thread()
+        with self._lock:
+            self._timers.discard(me)  # type: ignore[arg-type]
+        if self._stop.is_set():
+            # 调度器已停(退出软件 / 关闭定时):别让迟到的延时任务再动手(#6)
+            self._log.info("调度器已停止,忽略延时任务:%s", sanitize(t.name))
+            return
         try:
             self._invoke(t)
         except Exception as e:  # noqa: BLE001
