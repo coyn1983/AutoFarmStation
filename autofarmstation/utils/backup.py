@@ -28,6 +28,7 @@ import zipfile
 from pathlib import Path
 
 from .paths import user_data_dir
+from .sanitize import sanitize
 
 APP_NAME = "AutoFarmStation"
 SCHEMA = 1
@@ -89,9 +90,16 @@ def export_to(dest: Path | str) -> tuple[bool, str]:
                     z.write(path, rel)
                 except OSError:
                     skipped += 1
-        msg = f"已导出 {len(files) - skipped} 个文件到\n{dest}"
+        msg = f"已导出 {len(files) - skipped} 个文件到\n{sanitize(str(dest))}"
         if skipped:
             msg += f"\n(跳过 {skipped} 个读不到或过大的文件)"
+        # 备份里的 config.json/session.json 存的是**这台机器**的 exe 绝对路径 ——
+        # 这是恢复所必需的数据,不能脱敏(脱敏了就导不回来)。所以要提醒用户:
+        # 这份包适合自己在换机时用,不要当成「匿名反馈附件」发给别人(#14)。
+        msg += (
+            "\n\n注意:备份内含本机绝对路径(游戏 exe、AppData 等),"
+            "\n它是给自己换机/重装用的,不要直接发给他人或贴到公开渠道。"
+        )
         return (True, msg)
     except OSError as e:
         return (False, f"导出失败:{e}")

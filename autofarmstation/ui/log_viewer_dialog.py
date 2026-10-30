@@ -18,7 +18,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..utils.logger import log_file_path
-from ..utils.sanitize import user_log_dir_display
+from ..utils.sanitize import sanitize, user_log_dir_display
 
 # 只读文件尾部,避免日志很大时把内存吃满
 TAIL_BYTES = 512 * 1024
@@ -136,6 +136,9 @@ class LogViewerDialog(QDialog):
         if total > keep:
             lines = lines[-keep:]
         text = "\n".join(lines)
+        # 显示 / 「复制全部」的内容一律再脱敏一次:历史日志行里有 formatter 上线之前
+        # 写进去的 traceback 绝对路径(#14),别让它们在屏幕上和剪贴板里还原出来。
+        text = sanitize(text)
         # 尽量保持「贴着底部看最新」的阅读习惯
         sb = self._text.verticalScrollBar()
         at_bottom = sb.value() >= sb.maximum() - 4
@@ -143,13 +146,14 @@ class LogViewerDialog(QDialog):
         if at_bottom:
             sb.setValue(sb.maximum())
 
+        _shown_path = sanitize(str(self._path))
         if not self._path.is_file():
-            self._info.setText(f"日志文件还不存在:{self._path}")
+            self._info.setText(f"日志文件还不存在:{_shown_path}")
         else:
             shown = min(total, keep)
             extra = f"(只显示最后 {keep} 行)" if total > keep else ""
             self._info.setText(
-                f"{self._path}  ·  匹配 {total} 行,显示 {shown} 行 {extra} "
+                f"{_shown_path}  ·  匹配 {total} 行,显示 {shown} 行 {extra} "
                 f"·  目录:{user_log_dir_display()}"
             )
 
@@ -172,7 +176,7 @@ class LogViewerDialog(QDialog):
         except OSError as e:
             QMessageBox.warning(self, "导出日志", f"导出失败:{e}")
             return
-        QMessageBox.information(self, "导出日志", f"已导出到\n{dest}")
+        QMessageBox.information(self, "导出日志", f"已导出到\n{sanitize(dest)}")
 
     def _on_open_dir(self) -> None:
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(self._path.parent)))

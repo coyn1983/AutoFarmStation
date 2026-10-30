@@ -20,7 +20,8 @@ import os
 import re
 from pathlib import Path
 
-from ..utils.paths import steam_config_path
+from ..utils.paths import atomic_write, steam_config_path
+from ..utils.sanitize import sanitize
 
 
 _log = logging.getLogger("autofarmstation.steam_overlay")
@@ -80,11 +81,12 @@ def set_overlay(enabled: bool, *, backup: str = "",
             return False, original
     new_text = _patch_overlay(original, target)
     try:
-        p.write_text(new_text, encoding="utf-8")
+        # 原来是截断式 write_text:崩在中间会留半截 steam.cfg(#Low)
+        atomic_write(p, new_text)
     except OSError as e:
         _log.warning("写入 steam.cfg 失败: %s", e)
         return False, original
-    _log.info("steam.cfg: SteamOverlay=%s (path=%s)", target, p)
+    _log.info("steam.cfg: SteamOverlay=%s (path=%s)", target, sanitize(str(p)))
     return True, backup or original
 
 
@@ -95,7 +97,7 @@ def restore_backup(backup_text: str, *, path: Path | None = None) -> tuple[bool,
     p = path or steam_config_path()
     p.parent.mkdir(parents=True, exist_ok=True)
     try:
-        p.write_text(backup_text, encoding="utf-8")
+        atomic_write(p, backup_text)
         return True, backup_text
     except OSError as e:
         _log.warning("还原 steam.cfg 失败: %s", e)

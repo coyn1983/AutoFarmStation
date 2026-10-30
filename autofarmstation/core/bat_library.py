@@ -27,7 +27,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from ..utils.paths import bundled_bat_dir, user_bat_dir
+from ..utils.paths import bundled_bat_dir, contained_path, safe_filename, user_bat_dir
 
 
 _log = logging.getLogger("autofarmstation.bat_library")
@@ -37,6 +37,7 @@ _CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
 
 # manifest 单文件超过这个大小就视为可疑,跳过
 _MAX_MANIFEST_BYTES = 256 * 1024
+_MAX_BAT_BYTES = 256 * 1024  # 单个脚本导入上限(超过就是误拖了二进制/日志文件)
 
 
 @dataclass(frozen=True)
@@ -63,9 +64,13 @@ class BatEntry:
     full_path: Path | None = None
 
     def resolved_path(self) -> Path | None:
+        """脚本的真实路径;``file_name`` 越界(逃出 manifest 目录)时视为不存在(#10)."""
         if self.manifest_dir is None:
             return None
-        p = self.manifest_dir / self.file_name
+        try:
+            p = contained_path(self.manifest_dir, self.file_name)
+        except ValueError:
+            return None
         return p if p.exists() else None
 
 
@@ -155,6 +160,11 @@ class BatLibrary:
         suffix = src.suffix.lower()
         if suffix not in (".bat", ".cmd"):
             raise ValueError(f"只支持 .bat / .cmd 文件,收到:{src.name}")
+        # 先查大小再读内容:整个文件 read_bytes() 之前必须有上限(#11)
+        size = src.stat().st_size
+        if size > _MAX_MANIFEST_BYTES:
+            raise ValueError(
+                f"脚本过大({size // 1024}KB > {_MAX_MANIFEST_BYTES // 1024}KB),已拒绝导入")
 
         # 读源文件内容(优先 utf-8,回退 gbk → utf-16)
         raw_bytes = src.read_bytes()
@@ -233,16 +243,21 @@ class BatLibrary:
             ) -> subprocess.Popen | None:
         """非阻塞启动 .bat,args 拼成 ``--key=value`` 形式传给脚本."""
         e = self.get(entry_id)
-        if e is None or e.full_path is None or not e.full_path.exists():
+        if e is None:
             return None
-        cmd = [str(e.full_path)]
-        for a in (args or {}).items():
-            cmd.append(f"--{a[0]}={a[1]}")
+        # 执行前只认「manifest 目录内 + .bat/.cmd」两个条件都成立的路径(#10)
+        path = e.resolved_path()
+        if path is None or path.suffix.lower() not in (".bat", ".cmd"):
+            _log.warning("拒绝执行:脚本路径越界或不是 bat/cmd(%s)", e.file_name)
+            return None
+        cmd = [str(path)]
+        for k, v in list((args or {}).items())[:32]:
+            cmd.append(f"--{str(k)[:32]}={str(v)[:512]}")
         try:
             return subprocess.Popen(
                 cmd,
                 creationflags=_CREATE_NO_WINDOW,
-                cwd=str(e.manifest_dir or e.full_path.parent),
+                cwd=str(e.manifest_dir or path.parent),
             )
         except OSError as ex:
             _log.warning("启动 bat 失败: %s", ex)
@@ -251,17 +266,20 @@ class BatLibrary:
     def reveal(self, entry_id: str) -> bool:
         """在文件管理器中定位脚本."""
         e = self.get(entry_id)
-        if e is None or e.full_path is None or not e.full_path.exists():
+        if e is None:
+            return False
+        target = e.resolved_path() or e.full_path
+        if target is None or not target.exists():
             return False
         try:
             if sys.platform == "win32":
                 # explorer.exe /select, 高亮文件
                 subprocess.Popen(
-                    ["explorer", "/select,", str(e.full_path)],
+                    ["explorer", "/select,", str(target)],
                     creationflags=_CREATE_NO_WINDOW,
                 )
             else:
-                subprocess.Popen(["xdg-open", str(e.full_path.parent)])
+                subprocess.Popen(["xdg-open", str(target.parent)])
             return True
         except OSError as ex:
             _log.warning("打开目录失败: %s", ex)
@@ -270,13 +288,17 @@ class BatLibrary:
     def edit(self, entry_id: str) -> bool:
         """用系统默认编辑器打开脚本."""
         e = self.get(entry_id)
-        if e is None or e.full_path is None or not e.full_path.exists():
+        if e is None:
+            return False
+        target = e.resolved_path()
+        if target is None:
+            _log.warning("拒绝打开:脚本路径越界(%s)", e.file_name)
             return False
         try:
             if sys.platform == "win32":
-                os.startfile(str(e.full_path))  # type: ignore[attr-defined]
+                os.startfile(str(target))  # type: ignore[attr-defined]
             else:
-                subprocess.Popen(["xdg-open", str(e.full_path)])
+                subprocess.Popen(["xdg-open", str(target)])
             return True
         except OSError as ex:
             _log.warning("打开编辑器失败: %s", ex)
@@ -409,32 +431,49 @@ class BatLibrary:
             for raw in data.get("entries") or []:
                 if not isinstance(raw, dict):
                     continue
-                out.append(_materialize(raw, builtin=builtin, manifest_dir=d))
+                try:
+                    out.append(_materialize(raw, builtin=builtin, manifest_dir=d))
+                except ValueError as e:
+                    # manifest 里的 file/id 越界:整条丢弃,绝不拼出目录外的路径(#10)
+                    _log.error("跳过非法 bat 条目 %s: %s", mf, e)
         return out
 
 
 # ---------- helpers ----------
 def _materialize(raw: dict[str, Any], *, builtin: bool,
                  manifest_dir: Path | None) -> BatEntry:
+    """把 manifest 的一条记录变成 BatEntry.
+
+    ``file`` 字段来自可编辑的 JSON,必须落在 manifest 所在目录内,否则条目可以
+    指向库外的任意 .bat 并被执行 —— 这里是唯一的落点校验(#10)。
+    """
     args = []
-    for a in raw.get("args") or []:
+    for a in (raw.get("args") or [])[:64]:
         if not isinstance(a, dict):
             continue
         args.append(BatArg(
-            name=str(a.get("name") or ""),
-            label=str(a.get("label") or a.get("name") or ""),
-            default=str(a.get("default") or ""),
+            name=str(a.get("name") or "")[:64],
+            label=str(a.get("label") or a.get("name") or "")[:120],
+            default=str(a.get("default") or "")[:512],
             required=bool(a.get("required", False)),
         ))
     file_name = str(raw.get("file") or f"{raw.get('id')}.bat")
-    full = (manifest_dir / file_name) if manifest_dir else None
+    full: Path | None = None
+    if manifest_dir is not None:
+        full = contained_path(manifest_dir, file_name)
+        file_name = full.name
+    else:
+        file_name = safe_filename(Path(file_name.replace("\\", "/")).name)
+    if not file_name.lower().endswith((".bat", ".cmd")):
+        raise ValueError(f"不是 bat/cmd 脚本:{file_name}")
+    entry_id = str(raw.get("id") or file_name)[:120]
     return BatEntry(
-        id=str(raw.get("id") or file_name),
-        title=str(raw.get("title") or raw.get("id") or file_name),
-        desc=str(raw.get("desc") or ""),
+        id=entry_id,
+        title=str(raw.get("title") or raw.get("id") or file_name)[:120],
+        desc=str(raw.get("desc") or "")[:2000],
         file_name=file_name,
-        category=str(raw.get("category") or "其他"),
-        tags=list(raw.get("tags") or []),
+        category=str(raw.get("category") or "其他")[:60],
+        tags=[str(t)[:60] for t in (raw.get("tags") or [])[:16]],
         confirm=bool(raw.get("confirm", True)),
         args=args,
         builtin=builtin,
@@ -454,15 +493,18 @@ def _read_or_init_manifest(d: Path) -> dict:
 
 
 def _write_manifest(d: Path, data: dict) -> None:
+    """写 manifest:唯一临时名 + ``os.replace``,不再有「文件短暂不存在」的窗口(#9)."""
     mf = d / "manifest.json"
-    tmp = mf.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    if mf.exists():
+    tmp = mf.with_name(f"manifest.{os.getpid()}.{uuid.uuid4().hex[:8]}.json.tmp")
+    try:
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(str(tmp), str(mf))
+    finally:
         try:
-            mf.unlink()
+            if tmp.exists():
+                tmp.unlink()
         except OSError:
             pass
-    tmp.replace(mf)
 
 
 def _safe(s: str) -> str:

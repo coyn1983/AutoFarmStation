@@ -10,17 +10,24 @@
 - embed 时快照还原所需状态(原 parent / 样式 / 矩形 / 是否最小化)
 - 修改 GWL_STYLE 后必须 SWP_FRAMECHANGED,非客户区才会立即重绘
 - 全部操作幂等且线程安全;release 对未嵌入的窗口是安全的 no-op
+
+崩溃补偿(审计报告 #7):嵌入状态同时写一份 journal 文件,因为 `_states` 只在
+内存里时,软件崩溃后正在嵌入的游戏窗口会「挂在一个已死的父窗口上」—— 标题栏
+样式被剥掉、父窗口被改过,而 README 承诺的「退出自动还原」没有任何兜底。
+现在 release 成功之后才移除状态,启动时还会回放一次 journal 把残留窗口还原。
 """
 
 from __future__ import annotations
 
 import ctypes
+import json
 import threading
 import time
 from ctypes import wintypes
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 
 from . import window_finder as wf
+from ..utils.paths import atomic_write, user_data_dir
 
 # 需要去掉的「顶层窗口」装饰:标题栏/系统菜单/可缩放边框/最小化/最大化按钮
 WS_MINIMIZEBOX = 0x00020000
@@ -62,6 +69,73 @@ class _EmbedState:
 
 
 _states: dict[int, _EmbedState] = {}
+
+
+def _journal_path():
+    """嵌入状态流水文件位置(%APPDATA%\\AutoFarmStation\\embed_journal.json)."""
+    return user_data_dir() / "embed_journal.json"
+
+
+def _journal_write() -> None:
+    """把当前所有嵌入状态落盘 —— 崩溃后启动时靠它还原残留窗口(#7)."""
+    with _lock:
+        payload = [asdict(st) for st in _states.values()]
+    try:
+        atomic_write(_journal_path(), json.dumps(
+            payload, ensure_ascii=False, indent=2))
+    except OSError:
+        pass
+
+
+def recover_embedded_windows(log=None) -> int:
+    """启动时回放 journal,把上次崩溃/被强杀时留在嵌入态的窗口还原.
+
+    只做「父窗口或样式确实还处在被我们改过的状态」的窗口,避免误动正常窗口。
+    返回成功还原的数量。
+    """
+    try:
+        rows = json.loads(_journal_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return 0
+    if not isinstance(rows, list):
+        return 0
+    n = 0
+    for raw in rows:
+        if not isinstance(raw, dict):
+            continue
+        try:
+            st = _EmbedState(**raw)
+        except TypeError:
+            continue
+        if not wf._is_window(st.hwnd):
+            continue
+        try:
+            cur_parent = int(_user32.GetAncestor(st.hwnd, GA_PARENT) or 0)
+            style = int(_user32.GetWindowLongW(st.hwnd, wf.GWL_STYLE) or 0)
+        except Exception:  # noqa: BLE001
+            continue
+        still_embedded = (
+            cur_parent != int(st.orig_parent)
+            or (style & _STRIP_STYLE) != (int(st.orig_style) & _STRIP_STYLE)
+        )
+        if not still_embedded:
+            continue
+        with _lock:
+            _states[st.hwnd] = st
+        if release_window(st.hwnd):
+            n += 1
+        elif log:
+            try:
+                log.warning("残留嵌入窗口还原失败:hwnd=%s", st.hwnd)
+            except Exception:  # noqa: BLE001
+                pass
+    _journal_write()  # 无论成败都重写(失败条目留在内存里也救不回来,避免反复重试)
+    if n and log:
+        try:
+            log.info("上次异常退出遗留的 %d 个嵌入窗口已还原", n)
+        except Exception:  # noqa: BLE001
+            pass
+    return n
 
 
 def is_embedded(hwnd: int) -> bool:
@@ -136,6 +210,7 @@ def embed_window(hwnd: int, container_hwnd: int) -> bool:
 
     with _lock:
         _states[hwnd] = state
+    _journal_write()
     return True
 
 
@@ -150,14 +225,22 @@ def fit_to(hwnd: int, w: int, h: int) -> bool:
 
 
 def release_window(hwnd: int) -> bool:
-    """还原窗口(样式/位置/父窗口).未嵌入或窗口已销毁时返回 False."""
+    """还原窗口(样式/位置/父窗口).未嵌入或窗口已销毁时返回 False.
+
+    状态只在**还原成功之后**才移除:旧写法先 `pop` 再动手,中途任何异常返回
+    False 就让这个窗口永久失去追踪 —— 样式被剥、父窗口被改,却再也没人管(#7)。
+    """
     hwnd = int(hwnd)
     with _lock:
-        state = _states.pop(hwnd, None)
+        state = _states.get(hwnd)
     if state is None:
         return False
     if not wf._is_window(hwnd):
-        return False  # 窗口没了,无需还原
+        # 窗口真的没了,没什么可还原的,这时才丢弃状态
+        with _lock:
+            _states.pop(hwnd, None)
+        _journal_write()
+        return False
     try:
         # 1) 先换回原父(0 = 桌面)
         _user32.SetParent(hwnd, state.orig_parent or None)
@@ -173,16 +256,30 @@ def release_window(hwnd: int) -> bool:
         if state.orig_minimized:
             wf.show_window(hwnd, wf.SW_SHOWMINIMIZED)
     except Exception:
-        return False
+        return False  # 状态保留,下次退出 / journal 回放还能再试一次
+    with _lock:
+        _states.pop(hwnd, None)
+    _journal_write()
     return True
 
 
 def release_all() -> int:
-    """还原所有嵌入窗口(程序退出时调用).返回成功还原的数量."""
+    """还原所有嵌入窗口(程序退出时调用).返回成功还原的数量.
+
+    单个窗口失败不影响其它窗口,失败的状态保留在 journal 里等下次启动回放(#7)。
+    """
     with _lock:
         hwnds = list(_states.keys())
     n = 0
+    failed: list[int] = []
     for h in hwnds:
-        if release_window(h):
-            n += 1
+        try:
+            if release_window(h):
+                n += 1
+            else:
+                failed.append(h)
+        except Exception:  # noqa: BLE001
+            failed.append(h)
+    if failed:
+        _journal_write()
     return n

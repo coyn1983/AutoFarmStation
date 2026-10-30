@@ -19,7 +19,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Iterable
 
-from ..utils.paths import atomic_write, user_preset_dir
+from ..utils.paths import atomic_write, contained_path, safe_filename, user_preset_dir
 from .input_sender import MouseButton
 from .autoclicker import ClickPoint
 
@@ -319,6 +319,8 @@ class PresetLibrary:
     # --- 增删 ---
     def add(self, preset: Preset) -> None:
         preset.builtin = False
+        # id 会被拼成落盘文件名,必须先在来源不可信的前提下收进合法范围(#10)
+        preset.id = _safe_preset_id(preset.id, fallback_name=preset.name)
         with self._lock:
             self._items[preset.id] = preset
         self._save_user_presets()
@@ -339,17 +341,18 @@ class PresetLibrary:
             try:
                 raw = json.loads(f.read_text(encoding="utf-8"))
                 p = Preset(
-                    id=str(raw.get("id") or f.stem),
-                    name=str(raw.get("name") or ""),
-                    description=str(raw.get("description") or ""),
-                    steam_appid=str(raw.get("steam_appid") or ""),
-                    match_process=str(raw.get("match_process") or ""),
-                    match_title=str(raw.get("match_title") or ""),
+                    # id 来自文件内容,而它同时决定这份预设往哪儿落盘 —— 不能照抄(#10)
+                    id=_safe_preset_id(raw.get("id") or f.stem, fallback_name=f.stem),
+                    name=str(raw.get("name") or "")[:120],
+                    description=str(raw.get("description") or "")[:2000],
+                    steam_appid=str(raw.get("steam_appid") or "")[:32],
+                    match_process=str(raw.get("match_process") or "")[:120],
+                    match_title=str(raw.get("match_title") or "")[:120],
                     autoclicker=dict(raw.get("autoclicker") or {}),
                     key_macro=dict(raw.get("key_macro") or {}),
                     preview=dict(raw.get("preview") or {}),
                     builtin=False,
-                    tags=list(raw.get("tags") or []),
+                    tags=[str(t)[:60] for t in (raw.get("tags") or [])[:16]],
                 )
                 with self._lock:
                     if p.id not in self._items:
@@ -360,27 +363,47 @@ class PresetLibrary:
     def _save_user_presets(self) -> None:
         d = user_preset_dir()
         with self._lock:
-            for p in self._items.values():
-                if p.builtin:
-                    continue
-                f = d / f"{p.id}.json"
-                try:
-                    atomic_write(f, json.dumps(asdict(p), indent=2, ensure_ascii=False))
-                except Exception as e:  # noqa: BLE001
-                    self._log.warning("保存预设失败 %s: %s", p.id, e)
+            snapshot = [p for p in self._items.values() if not p.builtin]
+        for p in snapshot:
+            try:
+                f = contained_path(d, f"{_safe_preset_id(p.id, fallback_name=p.name)}.json")
+            except ValueError as e:
+                self._log.error("预设 id 非法,跳过保存 %s: %s", p.id, e)
+                continue
+            try:
+                atomic_write(f, json.dumps(asdict(p), indent=2, ensure_ascii=False))
+            except Exception as e:  # noqa: BLE001
+                self._log.warning("保存预设失败 %s: %s", p.id, e)
+
+
+def _safe_preset_id(raw, *, fallback_name: str = "") -> str:
+    """把预设 id 规整成「只有一段、字符合法」的名字(#10)."""
+    fallback = Path(str(fallback_name or "preset")).name or "preset"
+    try:
+        leaf = contained_path(user_preset_dir(), str(raw or ""), must_be_file=False)
+    except ValueError:
+        leaf = None
+    name = leaf.name if leaf is not None else ""
+    name = safe_filename(name) if name else ""
+    if not name or name in (".", "..", "unnamed"):
+        name = safe_filename(fallback)
+    return name[:80]
 
 
 # === 工具 ===
 def autoclicker_dict_to_points(d: dict) -> list[ClickPoint]:
-    """把预设 dict 转换为 ClickPoint 列表."""
+    """把预设 dict 转换为 ClickPoint 列表(数量与取值都做边界校验,#11)."""
+    from .autoclicker import MAX_POINTS, MAX_XY, clamp_int, clamp_ratio
     pts: list[ClickPoint] = []
-    for p in d.get("points", []) or []:
+    for p in (d.get("points", []) or [])[:MAX_POINTS]:
         try:
             pts.append(ClickPoint(
-                x=int(p.get("x", 0)),
-                y=int(p.get("y", 0)),
+                x=clamp_int(p.get("x", 0), 0, lo=0, hi=MAX_XY),
+                y=clamp_int(p.get("y", 0), 0, lo=0, hi=MAX_XY),
                 button=MouseButton(p.get("button", "left")),
                 double=bool(p.get("double", False)),
+                rx=clamp_ratio(p.get("rx", -1.0)),
+                ry=clamp_ratio(p.get("ry", -1.0)),
             ))
         except Exception:
             continue
@@ -388,15 +411,18 @@ def autoclicker_dict_to_points(d: dict) -> list[ClickPoint]:
 
 
 def key_macro_dict_to_steps(d: dict) -> list:
-    """把预设 dict 转换为 KeyStep 列表."""
+    """把预设 dict 转换为 KeyStep 列表(步骤数量与延时都有上限,#11)."""
     from .key_macro import KeyStep
+    from .autoclicker import MAX_STEPS, clamp_int
     out: list[KeyStep] = []
-    for s in d.get("steps", []) or []:
+    for s in (d.get("steps", []) or [])[:MAX_STEPS]:
         try:
             out.append(KeyStep(
-                key=str(s.get("key", "")),
-                hold_ms=int(s.get("hold_ms", 50)),
-                delay_before_ms=int(s.get("delay_before_ms", 0)),
+                key=str(s.get("key", ""))[:64],
+                vk=clamp_int(s.get("vk", 0), 0, lo=0, hi=0xFFFF),
+                hold_ms=clamp_int(s.get("hold_ms", 50), 50, lo=0, hi=60_000),
+                delay_before_ms=clamp_int(
+                    s.get("delay_before_ms", 0), 0, lo=0, hi=600_000),
             ))
         except Exception:
             continue

@@ -28,7 +28,7 @@ import os
 __version__ = "1.6.5"
 __app_name__ = "AutoFarmStation"
 __app_name_cn__ = "多开挂机大师"
-__author_handle__ = "zlwzk"
+__author_handle__ = "coyn1983"
 
 
 # === DPI 感知声明(必须在导入 PySide6 / 创建任何 QApplication 之前调用) ===
@@ -245,7 +245,7 @@ v1.6.1 解决了「点击、聚焦、缩放、识别」四件大事;但社区反
 ## 反馈
 
 应用内「帮助 → 反馈建议」一键前往 GitHub Issues(已脱敏)。
-仓库:[github.com/zlwzk/AutoFarmStation](https://github.com/zlwzk/AutoFarmStation)
+仓库:[github.com/coyn1983/AutoFarmStation](https://github.com/coyn1983/AutoFarmStation)
 
 ---
 

@@ -20,10 +20,18 @@
 3. swap helper 启动 30 秒内等不到父进程退出 → 放弃(不冒险覆盖)
 4. 校验下载文件大小 < 30MB 视为不完整 → 放弃
 5. 拷贝时 -Force 覆盖目标,启动新版本后顺手清掉 %TEMP% 里的临时 exe
+
+完整性(审计报告 #3 —— 这条链路等于「以用户权限执行下载下来的代码」):
+6. 下载地址必须是本仓库的 release 资产(`https://github.com/<repo>/releases/download/...`),
+   其它 host / scheme 一律拒绝;
+7. 下载完必须按发布时提供的 SHA-256(sidecar `.exe.sha256` 或 release 正文)校验,
+   取不到校验值就**拒绝自动更新**(只给下载页链接),宁可不更也不冒被执行的风险;
+8. swap helper 覆盖前先把旧 exe 备份成 `.bak`,复制或启动失败时回滚。
 """
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import os
 import subprocess
 import sys
@@ -35,13 +43,18 @@ from typing import Callable, Optional
 
 from ..__init__ import __app_name__, __version__
 from .paths import temp_dir
-from .update_checker import UpdateInfo
+from .update_checker import (
+    DEFAULT_REPO, UpdateInfo, fetch_expected_digest, is_allowed_download_url,
+)
 
 # === 常量 ===
 USER_AGENT: str = f"{__app_name__}/{__version__} (Windows)"
 MIN_VALID_EXE_SIZE: int = 30 * 1024 * 1024  # < 30MB 视为下载不完整
 PROGRESS_CHUNK: int = 64 * 1024  # 64KB
 HELPER_WAIT_TIMEOUT_SEC: int = 30
+DIGEST_CHUNK: int = 1024 * 1024
+# 没有 SHA-256 校验值时是否允许更新。默认 True(拒绝):#3 的根因就是下载即执行。
+REQUIRE_SHA256: bool = True
 
 
 @dataclasses.dataclass
@@ -52,6 +65,7 @@ class ApplyResult:
     downloaded_to: str = ""    # 本次下载的 exe 落地路径(若成功)
     error: str = ""            # 用户可读错误,空表示成功
     target_exe: str = ""       # 当前正在运行的 exe 路径
+    sha256: str = ""           # 已通过校验的摘要(交给 closeEvent 的助手再核一次)
 
 
 # === 路径探测 ===
@@ -114,6 +128,18 @@ class _DownloadCancelled(Exception):
     """用户取消。"""
 
 
+def sha256_of_file(path: Path) -> str:
+    """分块计算文件 SHA-256(十六进制小写)."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            block = f.read(DIGEST_CHUNK)
+            if not block:
+                break
+            h.update(block)
+    return h.hexdigest()
+
+
 # === 顶层入口 ===
 def download_and_apply_release(
     info: UpdateInfo,
@@ -122,14 +148,24 @@ def download_and_apply_release(
     cancel_cb: Optional[Callable[[], bool]] = None,
     log=None,
 ) -> ApplyResult:
-    """下载 info 指向的 release exe,落地到 %TEMP%。
+    """下载 info 指向的 release exe,落地到 %TEMP% 并校验 SHA-256。
 
     settings_dialog 在用户确认后调用本函数:
     - 返回 ok=False:仅展示 error,不动 cfg
-    - 返回 ok=True:settings_dialog 把 pending_update_path 写进 cfg,然后调主窗口 close()
+    - 返回 ok=True:settings_dialog 把 pending_update_path / pending_update_sha256
+      写进 cfg,然后调主窗口 close()
     """
     if not info.download_url:
         return ApplyResult(ok=False, error="远端 release 没有 .exe 资产可供下载")
+    # 1) 来源白名单:只允许本仓库的 release 下载地址(#3)
+    if not is_allowed_download_url(info.download_url, DEFAULT_REPO):
+        return ApplyResult(
+            ok=False,
+            error=(
+                "下载地址不属于本仓库的 release 资产,已拒绝。"
+                "请从 GitHub release 页面手动下载。"
+            ),
+        )
     target = current_exe_path()
     if target is None:
         return ApplyResult(
@@ -138,6 +174,18 @@ def download_and_apply_release(
         )
     if not target.exists():
         return ApplyResult(ok=False, error=f"目标 exe 不存在:{target}")
+
+    # 2) 取发布物声明的 SHA-256(sidecar 优先,其次 release 正文)
+    expected = (fetch_expected_digest(info) or "").lower()
+    if not expected and REQUIRE_SHA256:
+        return ApplyResult(
+            ok=False,
+            error=(
+                "该版本发布物没有提供 SHA-256 校验值,已拒绝自动更新"
+                "(下载即执行的风险不可接受)。请到 release 页面手动下载,"
+                "或等作者补上 .sha256 校验文件。"
+            ),
+        )
 
     dest = _pending_dest(target, info.latest_version)
     try:
@@ -181,12 +229,38 @@ def download_and_apply_release(
             error=f"下载文件过小({size // 1024 // 1024}MB),疑似不完整,已删除",
         )
 
+    # 3) 哈希校验:不符就删掉,绝不落到最终路径(#3)
+    try:
+        actual = sha256_of_file(dest)
+    except OSError as e:
+        try:
+            dest.unlink()
+        except OSError:
+            pass
+        return ApplyResult(ok=False, error=f"无法校验下载文件:{e}")
+    if expected and actual != expected:
+        try:
+            dest.unlink()
+        except OSError:
+            pass
+        if log:
+            try:
+                log.error("更新包哈希不匹配:期望 %s 实际 %s", expected, actual)
+            except Exception:  # noqa: BLE001
+                pass
+        return ApplyResult(
+            ok=False,
+            error="下载文件的 SHA-256 与发布值不一致,已删除。可能是传输被篡改或资产被替换。",
+        )
+
     if log:
         try:
-            log.info("下载完成: %s (%.1fMB)", dest, size / 1024 / 1024)
+            log.info("下载完成并通过校验: %s (%.1fMB) sha256=%s",
+                     dest, size / 1024 / 1024, actual[:16])
         except Exception:  # noqa: BLE001
             pass
-    return ApplyResult(ok=True, downloaded_to=str(dest), target_exe=str(target))
+    return ApplyResult(
+        ok=True, downloaded_to=str(dest), target_exe=str(target), sha256=actual)
 
 
 # === 关闭时:实际触发替换 ===
@@ -201,6 +275,7 @@ def apply_pending_update(cfg, main_window) -> bool:
     pending = (cfg.get("settings.pending_update_path") or "").strip()
     if not pending:
         return False
+    expected = (cfg.get("settings.pending_update_sha256") or "").strip().lower()
     target = (cfg.get("settings.pending_update_target_exe") or "").strip()
     if not target:
         # 没记目标 → 重新探测一次(理论上 cfg 里有,但防丢失)
@@ -209,28 +284,45 @@ def apply_pending_update(cfg, main_window) -> bool:
             return False
         target = str(cur)
 
+    def _clear_pending() -> None:
+        cfg.set("settings.pending_update_path", "")
+        cfg.set("settings.pending_update_target_exe", "")
+        cfg.set("settings.pending_update_sha256", "")
+        try:
+            cfg.save()
+        except Exception:  # noqa: BLE001
+            pass
+
     pending_p = Path(pending)
     target_p = Path(target)
     if not pending_p.exists():
-        cfg.set("settings.pending_update_path", "")
-        cfg.set("settings.pending_update_target_exe", "")
-        try:
-            cfg.save()
-        except Exception:  # noqa: BLE001
-            pass
+        _clear_pending()
         return False
+
+    # 临覆盖前再核一次哈希:下载后这个 %TEMP% 文件被动过就不更新(#3)
+    if REQUIRE_SHA256 and not expected:
+        _clear_pending()
+        return False
+    if expected:
+        try:
+            actual = sha256_of_file(pending_p)
+        except OSError:
+            _clear_pending()
+            return False
+        if actual != expected:
+            try:
+                pending_p.unlink()
+            except OSError:
+                pass
+            _clear_pending()
+            return False
 
     parent_pid = os.getpid()
     try:
-        launch_swap_helper(pending_p, target_p, parent_pid)
+        launch_swap_helper(pending_p, target_p, parent_pid, expected_sha256=expected)
     except Exception as e:  # noqa: BLE001
         # 助手起不来 → 清掉 pending,主程序正常退出
-        try:
-            cfg.set("settings.pending_update_path", "")
-            cfg.set("settings.pending_update_target_exe", "")
-            cfg.save()
-        except Exception:  # noqa: BLE001
-            pass
+        _clear_pending()
         if hasattr(main_window, "_log"):
             try:
                 main_window._log.error("无法启动更新助手:%s", e)  # type: ignore[attr-defined]
@@ -266,6 +358,19 @@ function Write-UpdLog([string]$msg) {
     } catch {}
 }
 
+function Restore-Backup {
+    # 覆盖失败 / 启动失败时把旧 exe 放回去,别让用户既没了新版也没了旧版
+    try {
+        if ((Test-Path -LiteralPath $script:BackupExe) -and -not (Test-Path -LiteralPath $TargetExe)) {
+            Copy-Item -LiteralPath $script:BackupExe -Destination $TargetExe -Force
+            Write-UpdLog ("已回滚到旧版本 " + $TargetExe)
+        }
+    } catch {
+        Write-UpdLog ("回滚失败: " + $_.Exception.Message)
+    }
+}
+
+$script:BackupExe = $TargetExe + ".bak"
 try {
     Write-UpdLog ("启动 ParentPid=" + $ParentPid + " NewExe=" + $NewExe + " TargetExe=" + $TargetExe)
     # 1) 等父进程退出,最多 30 秒
@@ -295,21 +400,48 @@ try {
         exit 4
     }
 
-    # 3) 拷贝新 exe 覆盖目标
+    # 2b) 覆盖前再核一次 SHA-256(主程序下载时已核过,这里防 %TEMP% 里被掉包)(#3)
+    $expect = ($env:AFS_UPDATER_SHA256 | Out-String).Trim().ToLower()
+    if ($expect) {
+        $actual = (Get-FileHash -LiteralPath $NewExe -Algorithm SHA256).Hash.ToLower()
+        if ($actual -ne $expect) {
+            Write-UpdLog ("哈希不一致,放弃覆盖 expect=" + $expect + " actual=" + $actual + " exit=5")
+            exit 5
+        }
+        Write-UpdLog "SHA-256 校验通过"
+    }
+
+    # 3) 备份旧 exe,再拷贝新 exe 覆盖目标
+    if (Test-Path -LiteralPath $TargetExe) {
+        try {
+            Copy-Item -LiteralPath $TargetExe -Destination $script:BackupExe -Force
+            Write-UpdLog ("已备份旧版本 " + $script:BackupExe)
+        } catch {
+            Write-UpdLog ("备份失败,放弃覆盖 exit=6: " + $_.Exception.Message)
+            exit 6
+        }
+    }
     Copy-Item -LiteralPath $NewExe -Destination $TargetExe -Force
     Write-UpdLog ("已覆盖目标 " + $TargetExe)
 
     # 4) 启动新版本
-    Start-Process -FilePath $TargetExe
+    try {
+        Start-Process -FilePath $TargetExe
+    } catch {
+        Write-UpdLog ("启动新版本失败,准备回滚: " + $_.Exception.Message)
+        Restore-Backup
+        exit 7
+    }
     Write-UpdLog "已启动新版本"
 
-    # 5) 清掉 %TEMP% 里的临时下载
+    # 5) 清掉 %TEMP% 里的临时下载;备份文件留着(下次更新前会被覆盖)
     try {
         Remove-Item -LiteralPath $NewExe -Force -ErrorAction SilentlyContinue
     } catch {}
     Write-UpdLog "完成 exit=0"
     exit 0
 } catch {
+    Restore-Backup
     Write-UpdLog ("异常 exit=1: " + $_.Exception.Message)
     exit 1
 }
@@ -326,8 +458,17 @@ def _detect_log_path() -> Optional[Path]:
         return None
 
 
-def launch_swap_helper(new_exe: Path, target_exe: Path, parent_pid: int) -> None:
-    """启动 PowerShell 助手:detach、不开窗、参数透传。"""
+def launch_swap_helper(
+    new_exe: Path,
+    target_exe: Path,
+    parent_pid: int,
+    *,
+    expected_sha256: str = "",
+) -> None:
+    """启动 PowerShell 助手:detach、不开窗、参数透传。
+
+    ``expected_sha256`` 交给助手在覆盖前再核一次(#3)。
+    """
     # 1) 脚本落地到 %TEMP%(UTF-8 BOM,让 PS5.1 也能识别中文路径)
     tmpdir = Path(tempfile.gettempdir())
     script_path = tmpdir / f"{__app_name__}_updater_{os.getpid()}.ps1"
@@ -337,6 +478,7 @@ def launch_swap_helper(new_exe: Path, target_exe: Path, parent_pid: int) -> None
     env = os.environ.copy()
     env["AFS_UPDATER_TIMEOUT"] = str(HELPER_WAIT_TIMEOUT_SEC)
     env["AFS_UPDATER_MIN_SIZE"] = str(MIN_VALID_EXE_SIZE)
+    env["AFS_UPDATER_SHA256"] = (expected_sha256 or "").lower()
     env["AFS_UPDATER_LOG"] = str(log_path) if log_path is not None else "NUL"
 
     # DETACHED_PROCESS(0x8)+CREATE_NO_WINDOW(0x08000000):不挂控制台、不弹窗
@@ -366,14 +508,18 @@ def launch_swap_helper(new_exe: Path, target_exe: Path, parent_pid: int) -> None
 # === 自检辅助 ===
 def build_fake_release(tag: str = "v9.9.9", asset_name: str = "AutoFarmStation.exe",
                        asset_size: int = 65_000_000) -> UpdateInfo:
-    """构造一个 UpdateInfo 给 UI/自检用(不去 GitHub 联网)。"""
+    """构造一个 UpdateInfo 给 UI/自检用(不去 GitHub 联网).
+
+    下载地址刻意用「本仓库 release」的合法前缀,这样自检走的是和真实更新
+    一样的白名单分支(#3);故意写成别的 host 的用例请自行构造。
+    """
     return UpdateInfo(
         has_update=True,
         latest_version=tag,
         current_version=__version__,
-        release_url=f"https://github.com/zlwzk/AutoFarmStation/releases/tag/{tag}",
+        release_url=f"https://github.com/{DEFAULT_REPO}/releases/tag/{tag}",
         release_notes="(fake release notes)",
-        download_url=f"https://example.invalid/{asset_name}",
+        download_url=f"https://github.com/{DEFAULT_REPO}/releases/download/{tag}/{asset_name}",
         asset_name=asset_name,
         asset_size=asset_size,
     )

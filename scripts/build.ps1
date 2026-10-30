@@ -115,5 +115,47 @@ if ($info.FileVersion -notlike "$ver*") {
 }
 Write-Host "[build] OK 版本资源校验通过: $ver" -ForegroundColor Green
 
+# === Step 5: 生成 SHA-256 sidecar(自动更新的完整性校验依赖它,#3) ===
+# 发布时必须把这两个文件一起传到同一个 release:
+#   AutoFarmStation.exe            → 资产本体
+#   AutoFarmStation.exe.sha256     → 纯文本,内含 64 位十六进制摘要
+# 软件端(utils/updater.py)只认本仓库 releases/download 前缀的下载地址,
+# 并且拿不到校验值就**拒绝自动更新** —— 少了这个 sidecar,用户只能手动下载。
+$hash = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash.ToLower()
+$sidecar = "$exe.sha256"
+Set-Content -LiteralPath $sidecar -Value ("{0}  AutoFarmStation.exe" -f $hash) -Encoding ascii -NoNewline
+Write-Host ("[build] OK SHA-256: {0}" -f $hash) -ForegroundColor Green
+Write-Host ("[build] OK 校验文件: {0}(发布时与 exe 一起上传到同一个 release)" -f $sidecar) -ForegroundColor Green
+
+# === Step 6: 代码签名(可选,但强烈建议) ===
+# 未签名的 exe 会被 SmartScreen / 杀软拦,也无法在更新链路上做 Authenticode 校验。
+# 有证书时设置环境变量后重跑本脚本即可自动签名:
+#   $env:AFS_SIGN_CERT   = "CN=Your Name"      (证书存储里的主题名),或
+#   $env:AFS_SIGN_PFX    = "C:\path\to\cert.pfx"
+#   $env:AFS_SIGN_PASS   = "pfx 密码"
+if ($env:AFS_SIGN_PFX -or $env:AFS_SIGN_CERT) {
+    $signer = Get-Command signtool.exe -ErrorAction SilentlyContinue
+    if (-not $signer) {
+        Write-Host "[build] !! 找不到 signtool.exe(Windows SDK),跳过签名" -ForegroundColor Yellow
+    } else {
+        $authArgs = if ($env:AFS_SIGN_PFX) {
+            @("/f", $env:AFS_SIGN_PFX, "/p", $env:AFS_SIGN_PASS)
+        } else {
+            @("/n", $env:AFS_SIGN_CERT)
+        }
+        & signtool.exe sign /fd SHA256 /tr "http://timestamp.digicert.com" /td SHA256 @authArgs $exe
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "[build] !! 签名失败" -ForegroundColor Red
+            exit 1
+        }
+        # 签名会改变文件内容 → sidecar 必须重算
+        $hash = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash.ToLower()
+        Set-Content -LiteralPath $sidecar -Value ("{0}  AutoFarmStation.exe" -f $hash) -Encoding ascii -NoNewline
+        Write-Host ("[build] OK 已签名,SHA-256 已更新: {0}" -f $hash) -ForegroundColor Green
+    }
+} else {
+    Write-Host "[build] 未配置签名(AFS_SIGN_PFX / AFS_SIGN_CERT 都没设),产物保持未签名" -ForegroundColor Yellow
+}
+
 Write-Host ""
 Write-Host "[build] OK 完成。可执行: $exe" -ForegroundColor Green
