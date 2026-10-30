@@ -173,22 +173,19 @@ class ProcessManager:
         """强制添加:枚举这个 PID 的**所有**顶层窗口(含隐藏 / 无标题 / 工具窗口)。
 
         用途:游戏主窗口被藏 / 无标题时,普通 add_by_pid 找不到,这里给个退路。
-        取第一个候选;若用户想要全部,可以多调几次(用 FindWindowEx 选子窗口)。
+        挑「最像主窗口」的那一个交给 `wf.pick_main_window`(尺寸 / 状态 / 标题 /
+        是否垃圾辅助窗),而不是旧写法那种平手按枚举顺序的排法 —— PoE 最小化时
+        真主窗口会被 1x1 的 GDI+ / 10x10 的 DXGIWatchdog 顶掉。
+        想要别的那个窗口,请用「选择窗口」勾「包含隐藏窗口」自己挑。
         """
         from . import window_finder as wf
 
         candidates = wf.list_all_windows_for_pid(pid, include_hidden=True)
         if not candidates:
             return []
-        # 优先挑可见的、看起来像主窗口的;再退到任意一个
-        candidates.sort(
-            key=lambda i: (
-                0 if (i.visible and i.title.strip()) else 1,
-                0 if not i.is_tool_window else 1,
-                i.title == "",
-            )
-        )
-        picked = candidates[0]
+        picked = wf.pick_main_window(candidates)
+        if picked is None:
+            return []
         name, exe = self._lookup_process(pid)
         item = TrackedProcess(
             hwnd=picked.hwnd,

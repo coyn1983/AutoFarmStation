@@ -282,41 +282,101 @@ def list_all_windows_for_pid(
     return out
 
 
+def list_all_toplevel_windows(*, include_child: bool = False) -> list[WindowInfo]:
+    """一次 EnumWindows 拿到所有顶层窗口(含隐藏 / 最小化 / 无标题).
+
+    这是「列窗口」的正确姿势:整轮枚举只走一遍。旧写法(按每个 PID 各调一次
+    `list_all_windows_for_pid`)在 288 进程的机器上等于 288 次全量 EnumWindows,
+    勾上「包含隐藏窗口」后界面会僵住一秒起。
+    """
+    out: list[WindowInfo] = []
+
+    def cb(hwnd: int, _lparam: int) -> bool:
+        info = get_window_info(hwnd)
+        if info is None:
+            return True
+        if not include_child:
+            try:
+                style = _user32.GetWindowLongW(hwnd, GWL_STYLE)
+            except Exception:  # noqa: BLE001
+                style = 0
+            if style & WS_CHILD:
+                return True
+        out.append(info)
+        return True
+
+    _user32.EnumWindows(WNDENUMPROC(cb), 0)
+    return out
+
+
+# 这些标题 / 类名永远不是游戏主窗口(是 GDI 辅助窗、输入法代理窗等)
+_JUNK_WINDOW_MARKS: tuple[str, ...] = (
+    "gdi+ window", "dxgiwatchdogthreadwindow", "default ime", "msctfime ui",
+    "ime-ui-default", "ime", "windows live", "gld20",
+)
+
+
+def is_junk_window(info: WindowInfo) -> bool:
+    """判断某窗口是不是那种「1x1 的假窗口」(PoE 就有 GDI+ / DXGIWatchdog 两个)."""
+    hay = f"{(info.title or '').strip().lower()} {(info.class_name or '').lower()}"
+    return any(mark in hay for mark in _JUNK_WINDOW_MARKS)
+
+
+def window_rank(info: WindowInfo) -> tuple[int, int, int, int]:
+    """给「哪个窗口更像游戏主窗口」打分,元组小的优先。
+
+    旧排序只看 `visible + 有标题`,于是最小化的真主窗口会被降到和一堆 1x1 的
+    GDI+/DXGI/IME 假窗口同一档,平手后按枚举顺序反而挑中假窗口 —— 表现就是
+    「按 PID 添加进去了,但预览是空白、点击没反应」。
+    """
+    title = (info.title or "").strip()
+    junk = 1 if is_junk_window(info) else 0
+    cw, ch = (0, 0)
+    try:
+        if info.hwnd:
+            cw, ch = client_size(info.hwnd)
+    except Exception:  # noqa: BLE001
+        cw, ch = (0, 0)
+    area = max(cw * ch, info.width * info.height)
+    if cw >= 200 and ch >= 150 or area >= 200 * 150:
+        size_rank = 0            # 尺寸像一个真画面
+    elif area >= 64 * 64:
+        size_rank = 1
+    else:
+        size_rank = 2            # 1x1 / 10x10 这类辅助窗
+    if info.visible:
+        state_rank = 0
+    elif info.is_minimized:
+        state_rank = 1
+    else:
+        state_rank = 2
+    no_title = 1 if not title else 0
+    tool = 1 if (info.is_tool_window and not info.is_app_window) else 0
+    return (junk, size_rank, state_rank, no_title, tool)
+
+
+def pick_main_window(candidates: list[WindowInfo]) -> WindowInfo | None:
+    """从同一进程的候选里挑最像主窗口的那个(空列表返回 None)."""
+    if not candidates:
+        return None
+    return min(candidates, key=window_rank)
+
+
 def list_all_windows_across_processes(
     *,
     include_hidden: bool = True,
     only_toplevel: bool = True,
     pid_limit: int = 600,
 ) -> list[WindowInfo]:
-    """枚举所有 PID 的所有窗口(含隐藏 / 无标题)。「选择窗口」对话框勾选
-    「包含隐藏窗口」时用这个;成本比 list_visible_windows 高(遍历每个 PID)。
+    """所有进程的所有顶层窗口(含隐藏 / 无标题)。「选择窗口」勾选
+    「包含隐藏窗口」时用这个。
 
-    pid_limit 默认 600,防止某些机器进程数爆炸把 UI 卡住。
+    实现已改为**一次 EnumWindows**(`list_all_toplevel_windows`),不再按 PID
+    反复全量枚举;`pid_limit` 保留只为兼容老调用方签名,现在不再起作用。
     """
-    try:
-        import psutil  # type: ignore
-    except Exception:
-        return []
-    out: list[WindowInfo] = []
-    pids: list[int] = []
-    try:
-        for p in psutil.process_iter(["pid"]):
-            pid = int(p.info.get("pid") or 0)
-            if pid:
-                pids.append(pid)
-                if len(pids) >= pid_limit:
-                    break
-    except Exception:
-        return out
-    for pid in pids:
-        try:
-            out.extend(
-                list_all_windows_for_pid(
-                    pid, include_hidden=include_hidden, only_toplevel=only_toplevel,
-                )
-            )
-        except Exception:
-            continue
+    out = list_all_toplevel_windows(include_child=not only_toplevel)
+    if not include_hidden:
+        out = [w for w in out if w.visible and (w.title or "").strip()]
     return out
 
 

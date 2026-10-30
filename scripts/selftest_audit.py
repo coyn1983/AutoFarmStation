@@ -591,6 +591,110 @@ def t_audit_log_sanitization() -> bool:
         return False
 
 
+def t_audit_selector_hidden_checkbox() -> bool:
+    """勾选「包含隐藏窗口」不该让列表清空:toggled 传的是 bool,不是筛选文字."""
+    _div("审计:选择窗口对话框(包含隐藏窗口)")
+    try:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+        from autofarmstation.ui.process_selector_dialog import ProcessSelectorDialog
+
+        app = QApplication.instance() or QApplication([])
+        dlg = ProcessSelectorDialog()
+        base = dlg._list.count()
+        # 这条以前会炸:`QCheckBox.toggled` → `_refresh(True)` → `True.lower()`
+        dlg._chk_hidden.setChecked(True)
+        with_hidden = dlg._list.count()
+        assert with_hidden >= base, (base, with_hidden)
+        assert base > 0, "这台机器上一个可见有标题窗口都没有,用例无法判定"
+        # 取消勾选也要还在(不能一路变空)
+        dlg._chk_hidden.setChecked(False)
+        assert dlg._list.count() >= 1, "取消勾选后列表空了"
+        # 文本筛选仍然有效
+        dlg._filter.setText("绝对不可能存在的标题zzz")
+        assert dlg._list.count() == 0
+        dlg._filter.setText("")
+        assert dlg._list.count() >= base
+        dlg.deleteLater()
+        app.processEvents()
+        _ok(f"勾选/取消勾选都不掉空({base} → {with_hidden}),筛选仍生效")
+        return True
+    except Exception as e:  # noqa: BLE001
+        _fail("audit_selector_hidden_checkbox", e)
+        return False
+
+
+def t_audit_main_window_ranking() -> bool:
+    """挑主窗口的排序:最小化的真窗口要赢过 1x1 / 10x10 的辅助窗."""
+    _div("审计:按 PID 添加时挑中哪个窗口")
+    try:
+        from autofarmstation.core.window_finder import (
+            WindowInfo, is_junk_window, pick_main_window, window_rank)
+
+        def _mk(hwnd, title, cls, *, visible, minimized=False, rect=(0, 0, 8, 8),
+                tool=False):
+            return WindowInfo(
+                hwnd=hwnd, pid=9888, title=title, class_name=cls, rect=rect,
+                visible=visible, is_tool_window=tool, is_app_window=not tool,
+                has_caption=True, is_minimized=minimized)
+
+        # 复刻 Path of Exile 最小化时的真实窗口集合
+        watchdog = _mk(99000101, "DXGIWatchdogThreadWindow", "DXGIWatchdogWindowClass",
+                       visible=False)
+        gdi = _mk(99000102, "GDI+ Window (PathOfExile.exe)", "GDI+ Window Class",
+                  visible=False)
+        ime = _mk(99000103, "Default IME", "IME", visible=False)
+        main_min = _mk(99000104, "Path of Exile", "POWEROFTHEEXILE",
+                       visible=False, minimized=True, rect=(-32000, -32000, -31763, -31961))
+        picked = pick_main_window([watchdog, gdi, ime, main_min])
+        assert picked is not None and picked.title == "Path of Exile", \
+            f"挑中了 {getattr(picked, 'title', None)!r}"
+        assert is_junk_window(watchdog) and is_junk_window(gdi) and is_junk_window(ime)
+        assert not is_junk_window(main_min)
+
+        # 正常可见的窗口应当排在最前
+        main_vis = _mk(99000105, "Path of Exile", "POWEROFTHEEXILE",
+                       visible=True, rect=(100, 100, 1380, 820))
+        assert window_rank(main_vis) < window_rank(main_min)
+        assert window_rank(main_vis) < window_rank(watchdog)
+        # 空候选不能崩
+        assert pick_main_window([]) is None
+        _ok("#Path of Exile 最小化主窗口被正确识别,辅助假窗口排到最后")
+        return True
+    except Exception as e:  # noqa: BLE001
+        _fail("audit_main_window_ranking", e)
+        return False
+
+
+def t_audit_single_pass_enumeration() -> bool:
+    """「包含隐藏窗口」走一次 EnumWindows,不再按 PID 反复全量枚举."""
+    _div("审计:窗口枚举只走一遍")
+    try:
+        from autofarmstation.core import window_finder as wf
+
+        t0 = time.time()
+        allwins = wf.list_all_toplevel_windows()
+        dt_all = time.time() - t0
+        assert allwins, "一个顶层窗口都没枚举到"
+
+        t0 = time.time()
+        via_api = wf.list_all_windows_across_processes()
+        dt_api = time.time() - t0
+        assert len(via_api) == len(allwins), (len(via_api), len(allwins))
+        assert dt_api < 1.0, f"枚举耗时 {dt_api:.2f}s,不像是单次遍历"
+        print(f"    (顶层 {len(allwins)} 个,全量 {dt_all*1000:.0f}ms / "
+              f"across_processes {dt_api*1000:.0f}ms)")
+
+        only_vis = wf.list_all_windows_across_processes(include_hidden=False)
+        assert all(w.visible and (w.title or "").strip() for w in only_vis), \
+            "include_hidden=False 时应当只留可见且有标题的窗口"
+        _ok("across_processes 改为一次枚举且与直接枚举一致")
+        return True
+    except Exception as e:  # noqa: BLE001
+        _fail("audit_single_pass_enumeration", e)
+        return False
+
+
 # 供 scripts.selftest.run_all() 追加调用
 TESTS = (
     t_audit_cross_thread_delivery,
@@ -603,4 +707,7 @@ TESTS = (
     t_audit_cleanup_chain,
     t_audit_embed_state_and_capture_resources,
     t_audit_log_sanitization,
+    t_audit_selector_hidden_checkbox,
+    t_audit_main_window_ranking,
+    t_audit_single_pass_enumeration,
 )
