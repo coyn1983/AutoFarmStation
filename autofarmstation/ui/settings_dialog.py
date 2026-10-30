@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
 from ..core import audio
 from ..utils.config import Config
 from ..utils.paths import steam_config_path
+from ..utils.sanitize import sanitize
 from ..core.steam_overlay import (
     describe as steam_overlay_describe,
     set_overlay as steam_overlay_set,
@@ -59,6 +60,7 @@ class SettingsDialog(QDialog):
         self._build_ui_group(v)
         self._build_preview_group(v)
         self._build_defaults_group(v)
+        self._build_input_group(v)
         self._build_audio_group(v)
         self._build_game_group(v)
         self._build_monitor_group(v)
@@ -342,6 +344,33 @@ class SettingsDialog(QDialog):
         self._steam_timeout.setRange(10, 600)
         self._steam_timeout.setValue(int(self._cfg.get("launch.steam_timeout_sec", 90)))
         gf.addRow("等待 Steam 启动超时:", with_unit(self._steam_timeout, "秒"))
+
+        parent_layout.addWidget(box)
+
+    def _build_input_group(self, parent_layout: QVBoxLayout) -> None:
+        """输入投递策略:真实输入(SendInput)回退的安全闸(#4)."""
+        box = QGroupBox("输入方式")
+        inf = QFormLayout(box)
+
+        self._allow_real = QCheckBox("允许「真实输入」回退(SendInput)")
+        self._allow_real.setChecked(bool(self._cfg.get("input.allow_real_fallback", True)))
+        inf.addRow("", self._allow_real)
+
+        self._require_fg = QCheckBox("回退前必须确认目标窗口已在前台")
+        self._require_fg.setChecked(bool(self._cfg.get("input.require_foreground", True)))
+        inf.addRow("", self._require_fg)
+
+        note = QLabel(
+            "「auto」模式在后台投递(PostMessage)失败时会改用真实输入:先把目标窗口\n"
+            "提到前台,再按客户区坐标发键鼠。Windows 的前台锁定 / 提权窗口会让\n"
+            "「提到前台」静默失败 —— 这时若照发,点击和按键就会落在你**当前正在用的**\n"
+            "窗口上(文档、浏览器、聊天框)。\n\n"
+            "勾选「回退前必须确认前台」后,确认失败就放弃这一次输入并在日志里说明原因;\n"
+            "完全不想让本软件发真实输入,就取消第一个勾选。"
+        )
+        note.setStyleSheet("color:#e0a080;")
+        note.setWordWrap(True)
+        inf.addRow(note)
 
         parent_layout.addWidget(box)
 
@@ -803,6 +832,8 @@ class SettingsDialog(QDialog):
         # 6) 写 cfg → 关闭主窗口(主窗口 closeEvent 会 spawn swap helper)
         self._cfg.set("settings.pending_update_path", apply_result.downloaded_to)
         self._cfg.set("settings.pending_update_target_exe", apply_result.target_exe)
+        # 已校验过的 SHA-256:助手在覆盖前再核一次,防止 %TEMP% 里的文件被掉包(#3)
+        self._cfg.set("settings.pending_update_sha256", apply_result.sha256)
         self._cfg.set("settings.last_update_check_at",
                       datetime.datetime.now().isoformat(timespec="seconds"))
         self._cfg.set("settings.last_update_found", info.latest_version)
@@ -950,7 +981,7 @@ class SettingsDialog(QDialog):
         self._overlay_info.setText(
             f"当前:{cur_txt}\n"
             f"目标:{target}\n"
-            f"路径:{info['path']}"
+            f"路径:{sanitize(str(info['path']))}"
         )
 
     def _on_apply_overlay(self) -> None:
@@ -1049,6 +1080,9 @@ class SettingsDialog(QDialog):
         self._cfg.set("launch.close_games_on_exit", self._close_games.isChecked())
         self._cfg.set("launch.kill_tree", self._kill_tree.isChecked())
         self._cfg.set("launch.steam_timeout_sec", self._steam_timeout.value())
+        # 输入方式(#4)
+        self._cfg.set("input.allow_real_fallback", self._allow_real.isChecked())
+        self._cfg.set("input.require_foreground", self._require_fg.isChecked())
         # 音量
         if audio.available():
             self._cfg.set("audio.apply_group_on_start", self._apply_group_on_start.isChecked())

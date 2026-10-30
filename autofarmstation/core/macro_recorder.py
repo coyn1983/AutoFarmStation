@@ -6,6 +6,11 @@
 注意:录制的坐标是屏幕绝对坐标;回放时可选择
 - 'absolute':按原始屏幕坐标(用 send 模式)
 - 'relative' :相对当前窗口客户区偏移(用 post 模式)
+
+隐私边界(审计报告 #2):pynput 的监听器是**系统级全局钩子**,一旦开录就会
+把用户在浏览器 / 密码管理器 / 聊天软件里的每一次按键都收进来。因此录制器
+默认只在「目标窗口在前台」时采集事件,并且有时长上限和事件数上限 —— 到点
+自动停,不依赖用户记得按停止。
 """
 
 from __future__ import annotations
@@ -19,6 +24,16 @@ from dataclasses import asdict, dataclass, field
 from typing import Callable
 
 from .input_sender import InputSender, parse_vk
+
+# === 录制与回放的安全边界(#2 / #11) ===
+MAX_RECORD_SECONDS = 120.0      # 单次录制最长时长,到点自动停止
+MAX_RECORD_EVENTS = 20_000      # 单次录制的事件数上限
+MAX_EVENTS_PER_SCRIPT = 20_000  # 载入宏 JSON 时保留的事件数上限
+MOVE_SAMPLE_MS = 50             # 鼠标移动降采样:最快每 50ms 记一个点
+MIN_EVENT_GAP_S = 0.005         # 回放时相邻事件的最小间隔(200 事件/秒封顶)
+MAX_T_MS = 24 * 3600 * 1000     # 事件时刻上限(24h)
+MAX_COORD = 100_000             # 屏幕坐标绝对值上限
+MAX_STRING_LEN = 200            # name/description/note 的长度上限
 
 
 class MacroEventType(str, enum.Enum):
@@ -42,6 +57,41 @@ class MacroEvent:
     note: str = ""
 
 
+def _clean_int(raw, default: int, lo: int, hi: int) -> int:
+    """把外部 JSON 的整数夹到 [lo, hi];无法解析时用默认值."""
+    try:
+        v = int(float(raw))
+    except (TypeError, ValueError):
+        return int(default)
+    return max(lo, min(hi, v))
+
+
+def _clean_text(raw, default: str) -> str:
+    if raw is None:
+        return default
+    return str(raw)[:MAX_STRING_LEN]
+
+
+def _clean_event(raw) -> MacroEvent | None:
+    """校验并清洗一条事件;结构不对 / 类型不认识 → None(丢弃)."""
+    if not isinstance(raw, dict):
+        return None
+    try:
+        etype = MacroEventType(str(raw.get("type", ""))).value
+    except ValueError:
+        return None
+    return MacroEvent(
+        type=etype,
+        t_ms=_clean_int(raw.get("t_ms", 0), 0, 0, MAX_T_MS),
+        x=_clean_int(raw.get("x", 0), 0, -MAX_COORD, MAX_COORD),
+        y=_clean_int(raw.get("y", 0), 0, -MAX_COORD, MAX_COORD),
+        button=_clean_text(raw.get("button", ""), "") if raw.get("button") else "",
+        vk=_clean_int(raw.get("vk", 0), 0, 0, 0xFFFF),
+        scroll=_clean_int(raw.get("scroll", 0), 0, -120, 120),
+        note=_clean_text(raw.get("note", ""), ""),
+    )
+
+
 @dataclass
 class MacroScript:
     """一个宏脚本."""
@@ -62,18 +112,37 @@ class MacroScript:
         return json.dumps(asdict(self), indent=2, ensure_ascii=False)
 
     @classmethod
-    def from_json(cls, text: str) -> "MacroScript":
+    def from_json(cls, text: str, *, max_bytes: int = 8 * 1024 * 1024) -> "MacroScript":
+        """从磁盘文本载入并做边界校验(#11).
+
+        宏文件是用户可任意编辑的 JSON:`events` 不设上限时一个几百 MB 的文件
+        会把内存吃光,`t_ms` 为 0/负数配合 loop 回放就是无停顿的输入风暴。
+        """
+        if max_bytes and len(text.encode("utf-8", "ignore")) > max_bytes:
+            raise ValueError(f"宏文件过大(> {max_bytes // 1024 // 1024} MB),已拒绝载入")
         d = json.loads(text)
-        evs = [MacroEvent(**e) for e in d.get("events", [])]
+        if not isinstance(d, dict):
+            raise ValueError("宏文件格式不正确:根节点应为对象")
+        evs: list[MacroEvent] = []
+        dropped = 0
+        for raw in (d.get("events", []) or [])[:MAX_EVENTS_PER_SCRIPT]:
+            ev = _clean_event(raw)
+            if ev is None:
+                dropped += 1
+                continue
+            evs.append(ev)
+        if dropped:
+            logging.getLogger("autofarmstation.macro").warning(
+                "宏 %s 有 %d 条事件非法,已丢弃", str(d.get("name", ""))[:60], dropped)
         return cls(
-            name=d.get("name", "未命名宏"),
-            description=d.get("description", ""),
-            created_at=d.get("created_at", ""),
-            duration_ms=d.get("duration_ms", 0),
+            name=_clean_text(d.get("name", "未命名宏"), "未命名宏"),
+            description=_clean_text(d.get("description", ""), ""),
+            created_at=_clean_text(d.get("created_at", ""), ""),
+            duration_ms=_clean_int(d.get("duration_ms", 0), 0, 0, MAX_T_MS),
             events=evs,
-            loop=d.get("loop", False),
-            base_w=int(d.get("base_w", 0) or 0),
-            base_h=int(d.get("base_h", 0) or 0),
+            loop=bool(d.get("loop", False)),
+            base_w=_clean_int(d.get("base_w", 0), 0, 0, MAX_COORD),
+            base_h=_clean_int(d.get("base_h", 0), 0, 0, MAX_COORD),
         )
 
 
@@ -94,6 +163,15 @@ class MacroRecorder:
         self._start_ts = 0.0
         self._events: list[MacroEvent] = []
         self._lock = threading.Lock()
+        # 隐私/资源限制(#2):目标窗口在前台才采集;超时 / 超量自动停
+        self._target_hwnd = 0
+        self._max_seconds = MAX_RECORD_SECONDS
+        self._max_events = MAX_RECORD_EVENTS
+        self._last_move_ms = -10_000.0
+        self._foreground_of = None
+        self._key_events = 0
+        self._dropped_moves = 0
+        self._limit_reason = ""
 
     @property
     def is_recording(self) -> bool:
@@ -104,7 +182,42 @@ class MacroRecorder:
         with self._lock:
             return len(self._events)
 
-    def start(self) -> bool:
+    @property
+    def key_event_count(self) -> int:
+        """本次录制采到的按键数(用于 UI 明示隐私影响)."""
+        with self._lock:
+            return self._key_events
+
+    @property
+    def limit_reason(self) -> str:
+        """自动停止的原因('' 表示是用户手动停的)."""
+        return self._limit_reason
+
+    @property
+    def elapsed_sec(self) -> float:
+        if not self._recording:
+            return 0.0
+        return max(0.0, time.time() - self._start_ts)
+
+    def remaining_sec(self) -> float:
+        """距离自动停止还剩多少秒(未录制时返回 0)."""
+        if not self._recording:
+            return 0.0
+        return max(0.0, self._max_seconds - (time.time() - self._start_ts))
+
+    def start(
+        self,
+        target_hwnd: int = 0,
+        *,
+        max_seconds: float = MAX_RECORD_SECONDS,
+        max_events: int = MAX_RECORD_EVENTS,
+    ) -> bool:
+        """开始录制.
+
+        ``target_hwnd`` 非 0 时(推荐)只采集「该窗口在前台」期间的输入,
+        用户在其它程序里的按键不会被记录;为 0 时是全系统采集,调用方
+        **必须**向用户明示这一点。
+        """
         if self._recording:
             return False
         try:
@@ -112,68 +225,84 @@ class MacroRecorder:
         except Exception as e:  # noqa: BLE001
             self._log.error("pynput 不可用,录制失败: %s", e)
             return False
+        try:
+            from . import window_finder as wf
+            self._foreground_of = wf.get_foreground_hwnd
+        except Exception:  # noqa: BLE001
+            self._foreground_of = None
 
         self._events = []
+        self._key_events = 0
+        self._dropped_moves = 0
+        self._limit_reason = ""
         self._start_ts = time.time()
+        self._last_move_ms = -10_000.0
+        self._target_hwnd = int(target_hwnd or 0)
+        self._max_seconds = max(5.0, float(max_seconds))
+        self._max_events = max(16, int(max_events))
         self._recording = True
 
         def on_move(x, y):
-            if not self._recording:
+            if not self._gate():
                 return
-            with self._lock:
-                self._events.append(MacroEvent(
-                    type=MacroEventType.MOUSE_MOVE.value,
-                    t_ms=int((time.time() - self._start_ts) * 1000),
-                    x=int(x), y=int(y),
-                ))
+            # 降采样:移动事件量最大,50ms 一个点足够还原轨迹(#2)
+            now_ms = (time.time() - self._start_ts) * 1000.0
+            if now_ms - self._last_move_ms < MOVE_SAMPLE_MS:
+                self._dropped_moves += 1
+                return
+            self._last_move_ms = now_ms
+            self._record(MacroEvent(
+                type=MacroEventType.MOUSE_MOVE.value,
+                t_ms=int(now_ms), x=int(x), y=int(y),
+            ))
 
         def on_click(x, y, button, pressed):
-            if not pressed or not self._recording:
+            if not pressed or not self._gate():
                 return
             from pynput.mouse import Button  # type: ignore
             name = {Button.left: "left", Button.right: "right", Button.middle: "middle"}.get(
                 button, "left"
             )
-            with self._lock:
-                self._events.append(MacroEvent(
-                    type=MacroEventType.MOUSE_CLICK.value,
-                    t_ms=int((time.time() - self._start_ts) * 1000),
-                    x=int(x), y=int(y),
-                    button=name,
-                ))
+            self._record(MacroEvent(
+                type=MacroEventType.MOUSE_CLICK.value,
+                t_ms=int((time.time() - self._start_ts) * 1000),
+                x=int(x), y=int(y),
+                button=name,
+            ))
 
         def on_scroll(x, y, dx, dy):
-            if not self._recording:
+            if not self._gate():
                 return
-            with self._lock:
-                self._events.append(MacroEvent(
-                    type=MacroEventType.MOUSE_SCROLL.value,
-                    t_ms=int((time.time() - self._start_ts) * 1000),
-                    x=int(x), y=int(y),
-                    scroll=int(dy or dx),
-                ))
+            self._record(MacroEvent(
+                type=MacroEventType.MOUSE_SCROLL.value,
+                t_ms=int((time.time() - self._start_ts) * 1000),
+                x=int(x), y=int(y),
+                scroll=int(dy or dx),
+            ))
 
         def on_key_press(k):
             if not self._recording:
                 return False
+            if not self._gate():
+                return  # 非目标窗口前台:忽略但不退出监听器
             vk = self._vk_from_key(k)
-            with self._lock:
-                self._events.append(MacroEvent(
-                    type=MacroEventType.KEY_DOWN.value,
-                    t_ms=int((time.time() - self._start_ts) * 1000),
-                    vk=vk,
-                ))
+            self._record(MacroEvent(
+                type=MacroEventType.KEY_DOWN.value,
+                t_ms=int((time.time() - self._start_ts) * 1000),
+                vk=vk,
+            ), is_key=True)
 
         def on_key_release(k):
             if not self._recording:
                 return False
+            if not self._gate():
+                return
             vk = self._vk_from_key(k)
-            with self._lock:
-                self._events.append(MacroEvent(
-                    type=MacroEventType.KEY_UP.value,
-                    t_ms=int((time.time() - self._start_ts) * 1000),
-                    vk=vk,
-                ))
+            self._record(MacroEvent(
+                type=MacroEventType.KEY_UP.value,
+                t_ms=int((time.time() - self._start_ts) * 1000),
+                vk=vk,
+            ), is_key=True)
 
         try:
             self._mouse_listener = mouse.Listener(  # type: ignore
@@ -184,11 +313,71 @@ class MacroRecorder:
             )
             self._mouse_listener.start()
             self._key_listener.start()
+            if self._target_hwnd:
+                self._log.info(
+                    "开始录制(仅目标窗口前台期间,最长 %.0fs / 最多 %d 事件) hwnd=%s",
+                    self._max_seconds, self._max_events, self._target_hwnd)
+            else:
+                self._log.warning(
+                    "开始录制(未指定目标窗口 → 采集全系统输入,最长 %.0fs)", self._max_seconds)
             return True
         except Exception as e:  # noqa: BLE001
             self._log.error("启动监听器失败: %s", e)
             self._recording = False
             return False
+
+    # --- 采集门控与落账 ---
+    def _gate(self) -> bool:
+        """此刻是否应该采集输入(#2 的核心开关).
+
+        - 时长超限 → 自动停止
+        - 指定了目标窗口 → 只有它在前台时才采(否则就是在录键盘记录器)
+        """
+        if not self._recording:
+            return False
+        if time.time() - self._start_ts > self._max_seconds:
+            self._auto_stop("达到录制时长上限")
+            return False
+        if self._target_hwnd and self._foreground_of is not None:
+            try:
+                if int(self._foreground_of() or 0) != self._target_hwnd:
+                    return False
+            except Exception:  # noqa: BLE001
+                return False
+        return True
+
+    def _record(self, ev: MacroEvent, *, is_key: bool = False) -> None:
+        with self._lock:
+            if len(self._events) >= self._max_events:
+                over = True
+            else:
+                over = False
+                self._events.append(ev)
+                if is_key:
+                    self._key_events += 1
+        if over:
+            self._auto_stop("事件数达到上限")
+
+    def _auto_stop(self, reason: str) -> None:
+        """到上限:停止采集,但不在钩子线程里 stop 监听器(pynput 的坑),
+        交给后台线程拆;脚本留在内存里等 UI 用 take_script() 取走(#2)。
+        """
+        if not self._recording:
+            return
+        self._recording = False
+        self._limit_reason = reason
+        self._log.warning("录制自动停止:%s", reason)
+        threading.Thread(
+            target=self._stop_listeners, name="RecorderStop", daemon=True
+        ).start()
+
+    def _stop_listeners(self) -> None:
+        for lst in (self._mouse_listener, self._key_listener):
+            try:
+                if lst:
+                    lst.stop()
+            except Exception:  # noqa: BLE001
+                pass
 
     @staticmethod
     def _vk_from_key(k) -> int:
@@ -215,28 +404,36 @@ class MacroRecorder:
         return int(special.get(k, 0))
 
     def stop(self) -> MacroScript | None:
-        if not self._recording:
+        """结束录制并交出脚本.
+
+        自动停止(超时长 / 超事件数)之后仍然可以调用本方法(或 take_script)
+        把已经采到的事件取走 —— 旧实现这时返回 None,事件被静默丢弃。
+        """
+        if not self._recording and not self._events:
             return None
         self._recording = False
-        try:
-            if self._mouse_listener:
-                self._mouse_listener.stop()
-            if self._key_listener:
-                self._key_listener.stop()
-        except Exception:
-            pass
+        self._stop_listeners()
         self._mouse_listener = None
         self._key_listener = None
-        # 按时间排序
         with self._lock:
             events = sorted(self._events, key=lambda e: e.t_ms)
-            duration = int((time.time() - self._start_ts) * 1000)
+            self._events = []
+        if not events:
+            return None
+        # 录制时长:以最后一条事件为准,再夹到上限内,避免 _start_ts 异常时
+        # 算出跨天的 t_ms。
+        duration = max(events[-1].t_ms, 0)
+        duration = min(duration, int(self._max_seconds * 1000))
         return MacroScript(
             name=f"宏-{time.strftime('%Y%m%d-%H%M%S')}",
             duration_ms=duration,
             events=events,
             created_at=time.strftime("%Y-%m-%d %H:%M:%S"),
         )
+
+    def take_script(self) -> MacroScript | None:
+        """录制已被自动停止时,由 UI 取走结果(等价于 stop)."""
+        return self.stop()
 
 
 class MacroPlayer:
@@ -351,6 +548,14 @@ class MacroPlayer:
             return (ex, ey)
 
         try:
+            # 事件时刻必须单调不减,并给相邻事件留一个最小间隔:t_ms 全 0
+            # (或被外部改坏)时,loop 回放会退化成无停顿的输入风暴(#11)。
+            schedule: list[float] = []
+            prev_s = -MIN_EVENT_GAP_S
+            for ev in self.script.events:
+                when = max(prev_s + MIN_EVENT_GAP_S, max(0, int(ev.t_ms)) / 1000.0)
+                schedule.append(when / self.speed)
+                prev_s = when
             while not self._stop.is_set():
                 if self._stop.is_set():
                     return
@@ -358,16 +563,17 @@ class MacroPlayer:
                     self._log.warning("目标窗口已失效")
                     return
                 t0 = time.time()
-                for ev in self.script.events:
+                for ev, when_s in zip(self.script.events, schedule):
                     if self._stop.is_set():
                         return
                     # 计算该事件的实际 deadline
-                    when = t0 + ev.t_ms / 1000.0 / self.speed
-                    self._sleep_until(when)
+                    self._sleep_until(t0 + when_s)
                     try:
                         if ev.type == MacroEventType.MOUSE_MOVE.value:
                             mx, my = _map(ev.x, ev.y)
-                            self._sender.move((self.hwnd, mx, my))
+                            ok_move, why_move = self._sender.move((self.hwnd, mx, my))
+                            if not ok_move:
+                                self._log.warning("移动失败:%s", why_move or "未知原因")
                         elif ev.type == MacroEventType.MOUSE_CLICK.value:
                             from .input_sender import MouseButton
                             btn = MouseButton(ev.button or "left")

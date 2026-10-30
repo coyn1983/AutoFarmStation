@@ -20,6 +20,35 @@ from typing import Callable
 
 from .input_sender import InputEventType, InputSender, MouseButton
 
+# === 载入与运行时的安全下界(审计报告 #8 / #11) ===
+MIN_INTERVAL_MS = 20      # 最快 50 次/秒:0 或负延时会让 CPU 打满并制造输入风暴
+MIN_KEY_GAP_MS = 10       # 键盘宏每步/每轮的最小间隔(同上,100 键/秒封顶)
+DEFAULT_INTERVAL_MS = 100  # 非法/缺失时的兜底值
+MAX_POINTS = 256          # 单份配置的点位上限(防超大 JSON 撑爆内存)
+MAX_STEPS = 4096          # 键盘宏步骤上限(同上)
+MAX_XY = 100_000          # 像素坐标绝对值上限
+HIDDEN_POLL_S = 0.5       # 目标窗口不可见时的重查间隔
+
+
+def clamp_int(raw, default: int, *, lo: int, hi: int) -> int:
+    """把外部 JSON 里的数值安全地落到 [lo, hi] 区间."""
+    try:
+        v = int(float(raw))
+    except (TypeError, ValueError):
+        return int(default)
+    return max(lo, min(hi, v))
+
+
+def clamp_ratio(raw) -> float:
+    """比例坐标:合法范围 0~1;非法/超界 → -1(表示「没有比例信息」)."""
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        return -1.0
+    if v < 0.0 or v > 1.0:
+        return -1.0
+    return v
+
 
 @dataclass
 class ClickPoint:
@@ -116,35 +145,40 @@ class AutoClickerConfig:
 
     @classmethod
     def from_dict(cls, d: dict) -> "AutoClickerConfig":
+        """从 JSON 载入并做边界校验(#11).
+
+        外部文件不可信:`interval_ms` 为 0/负数会打成输入风暴,`rx` 超范围
+        会把点算到客户区外,点位列表长度无上限会吃光内存 —— 全部在载入时夹住。
+        """
         pts: list[ClickPoint] = []
-        for raw in d.get("points", []) or []:
+        for raw in (d.get("points", []) or [])[:MAX_POINTS]:
+            if not isinstance(raw, dict):
+                continue
             try:
                 btn = MouseButton(str(raw.get("button", "left")))
             except ValueError:
                 btn = MouseButton.LEFT
-            try:
-                rx = float(raw.get("rx", -1.0))
-                ry = float(raw.get("ry", -1.0))
-            except (TypeError, ValueError):
-                rx = ry = -1.0
             pts.append(ClickPoint(
-                x=int(raw.get("x", 0)),
-                y=int(raw.get("y", 0)),
+                x=clamp_int(raw.get("x", 0), 0, lo=0, hi=MAX_XY),
+                y=clamp_int(raw.get("y", 0), 0, lo=0, hi=MAX_XY),
                 button=btn,
                 double=bool(raw.get("double", False)),
-                rx=rx,
-                ry=ry,
+                rx=clamp_ratio(raw.get("rx", -1.0)),
+                ry=clamp_ratio(raw.get("ry", -1.0)),
             ))
         return cls(
             hwnd=int(d.get("hwnd", 0) or 0),
             points=pts,
-            interval_ms=int(d.get("interval_ms", 100)),
-            jitter_pct=int(d.get("jitter_pct", 0)),
-            total_clicks=int(d.get("total_clicks", 0)),
+            interval_ms=clamp_int(
+                d.get("interval_ms", DEFAULT_INTERVAL_MS), DEFAULT_INTERVAL_MS,
+                lo=MIN_INTERVAL_MS, hi=24 * 3600 * 1000,
+            ),
+            jitter_pct=clamp_int(d.get("jitter_pct", 0), 0, lo=0, hi=100),
+            total_clicks=clamp_int(d.get("total_clicks", 0), 0, lo=0, hi=10 ** 9),
             loop=bool(d.get("loop", True)),
             mode=str(d.get("mode", "post")),
-            client_w=int(d.get("client_w", 0) or 0),
-            client_h=int(d.get("client_h", 0) or 0),
+            client_w=clamp_int(d.get("client_w", 0) or 0, 0, lo=0, hi=MAX_XY),
+            client_h=clamp_int(d.get("client_h", 0) or 0, 0, lo=0, hi=MAX_XY),
         )
 
 
@@ -175,6 +209,9 @@ class AutoClicker:
         self._done_count = 0
         self._lock = threading.Lock()
         self._started_at: float = 0.0
+        # 目标窗口当前是否「存在但不可见」(隐藏 / 最小化)。
+        # 这种情况只暂停本轮,不结束线程 —— 窗口回来就继续(#8)。
+        self._window_hidden = False
         # 回调
         self.on_click: Callable[[int, ClickPoint], None] | None = None  # (count, point)
         self.on_start: Callable[[], None] | None = None
@@ -201,6 +238,12 @@ class AutoClicker:
             return 0.0
         return time.time() - self._started_at
 
+    @property
+    def window_hidden(self) -> bool:
+        """目标窗口当前被隐藏/最小化,连点器在原地等待(不是故障,#8)."""
+        with self._lock:
+            return self._window_hidden
+
     # --- 控制 ---
     def start(self) -> bool:
         if self.is_running:
@@ -215,6 +258,8 @@ class AutoClicker:
         self._pause.set()
         self._done_count = 0
         self._started_at = time.time()
+        with self._lock:
+            self._window_hidden = False
         self._thread = threading.Thread(
             target=self._run, name=f"AutoClicker-{self.config.hwnd}", daemon=True
         )
@@ -228,14 +273,15 @@ class AutoClicker:
                        self.config.hwnd, len(self.config.points), self.config.interval_ms)
         return True
 
-    def stop(self) -> bool:
+    def stop(self, join_timeout: float = 1.0) -> bool:
         if not self.is_running:
             return False
         self._stop.set()
         self._pause.set()  # 解除暂停,让线程能快速退出
-        # join 但不阻塞 UI
+        # join 但不阻塞 UI。join_timeout 由调用方按「总预算」分配(#5):
+        # 预算用尽时不再干等 —— 线程是 daemon 且 stop 事件已置位,会自行退出。
         if self._thread:
-            self._thread.join(timeout=1.0)
+            self._thread.join(timeout=max(0.0, float(join_timeout)))
         self._thread = None
         if self.on_stop:
             try:
@@ -264,7 +310,9 @@ class AutoClicker:
     # --- 内部 ---
     def _sleep_interval(self) -> None:
         """睡眠 interval_ms,可被 pause/stop 中断."""
-        base = max(1, self.config.interval_ms) / 1000.0
+        # 运行时再兜一次底:即便配置绕过 from_dict(内存里被改成 0/负数),
+        # 也不会退化成 100% CPU 的合成输入风暴(#11)。
+        base = max(MIN_INTERVAL_MS, int(self.config.interval_ms)) / 1000.0
         jitter_pct = max(0, min(100, self.config.jitter_pct))
         if jitter_pct > 0:
             factor = 1.0 + random.uniform(-jitter_pct / 100.0, jitter_pct / 100.0)
@@ -293,9 +341,29 @@ class AutoClicker:
                     return
                 from . import window_finder as wf
                 info = wf.get_window_info(self.config.hwnd)
-                if info is None or not info.visible:
+                if info is None:
+                    # 窗口句柄真的没了(进程退出)才停止线程
                     self._log.info("窗口已失效,连点器自动停止 (hwnd=%s)", self.config.hwnd)
                     return
+                if not info.visible or info.is_minimized:
+                    # 隐藏 / 最小化 ≠ 失效。卡片隐藏窗口挂机是本软件的正常用法
+                    # (Headless / 嵌入),这里只跳过本轮并原地等待,窗口一回来
+                    # 就继续点 —— 旧实现在这里 return,连点器静默停止(#8)。
+                    with self._lock:
+                        first_time = not self._window_hidden
+                        self._window_hidden = True
+                    if first_time:
+                        self._log.info(
+                            "窗口不可见(隐藏/最小化),连点器等待中 (hwnd=%s)",
+                            self.config.hwnd,
+                        )
+                    self._stop.wait(HIDDEN_POLL_S)
+                    continue
+                with self._lock:
+                    was_hidden = self._window_hidden
+                    self._window_hidden = False
+                if was_hidden:
+                    self._log.info("窗口重新可见,连点器继续 (hwnd=%s)", self.config.hwnd)
 
                 pts = self.config.points
                 if not pts:

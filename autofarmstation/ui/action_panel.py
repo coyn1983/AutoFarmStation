@@ -28,6 +28,9 @@ from ..core import window_finder as wf
 from ..core.process_manager import TrackedProcess, ProcessManager
 from .widgets import styled_message, NumberField
 
+# 导入宏文件前先看大小:宏 JSON 属于「用户手改的外部输入」(#11)
+MAX_MACRO_FILE_BYTES = 8 * 1024 * 1024
+
 
 # === 连点器面板 ===
 class ClickerPanel(QWidget):
@@ -299,7 +302,11 @@ class ClickerPanel(QWidget):
         # 弹出一个透明全屏窗口,捕获鼠标点击坐标
         from .capture_point_dialog import CapturePointDialog
         dlg = CapturePointDialog(self._target_hwnd, self)
-        if dlg.exec() and dlg.captured:
+        if not dlg.exec() and getattr(dlg, "reject_reason", ""):
+            # 点到了标题栏 / 边框:明确告诉用户这一枪没记下来,而不是静默收 (0,0)(#13)
+            QMessageBox.warning(self, "选点", dlg.reject_reason)
+            return
+        if dlg.captured:
             cp = ClickPoint(x=dlg.captured[0], y=dlg.captured[1], button=MouseButton.LEFT)
             cw, ch = wf.client_size(self._target_hwnd)
             if not cp.set_ratio(cw, ch):
@@ -629,6 +636,15 @@ class KeyMacroPanel(QWidget):
 
 # === 宏录制面板 ===
 class RecorderPanel(QWidget):
+    """宏录制/回放面板.
+
+    录制是系统级钩子,因此有硬性隐私边界(#2):优先只采「目标窗口在前台」期间,
+    并且有最长时长与事件数上限,到点自动停。
+    """
+
+    _REC_MAX_SECONDS = 120.0
+    _REC_MAX_EVENTS = 20000
+
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._recorder = MacroRecorder()
@@ -708,32 +724,79 @@ class RecorderPanel(QWidget):
 
     def _on_toggle_record(self) -> None:
         if not self._recorder.is_recording:
-            if self._recorder.start():
-                self._btn_rec.setText("■ 停止录制")
-                self._btn_rec.setStyleSheet("color:#ff7575; font-weight:bold;")
-                self._status.setText(styled_message("正在录制鼠标键盘...", level="warn"))
-                self._events_list.clear()
-        else:
-            script = self._recorder.stop()
-            self._btn_rec.setText("● 开始录制")
-            self._btn_rec.setStyleSheet("")
-            if script:
-                self._script = script
-                # 记下录制时目标窗口的客户区尺寸:回放时按「当前尺寸/基准尺寸」
-                # 等比缩放,这样窗口被聚焦铺满或手动缩放后宏依然打在同一个位置。
-                if self._target_hwnd:
-                    cw, ch = wf.client_size(self._target_hwnd)
-                    if cw > 0 and ch > 0:
-                        script.base_w, script.base_h = int(cw), int(ch)
-                base_txt = (f" · 基准 {script.base_w}×{script.base_h}"
-                            if script.base_w and script.base_h else " · 无基准尺寸")
-                self._rec_status.setText(
-                    f"已录制: {script.name} · {len(script.events)} 事件 · "
-                    f"{script.duration_ms}ms{base_txt}"
-                )
-                self._events_list.clear()
-                for e in script.events[:200]:
-                    self._events_list.addItem(self._fmt_event(e))
+            self._begin_recording()
+            return
+        script = self._recorder.stop()
+        self._finish_recording(script)
+
+    def _start_recorder_ui(self) -> None:
+        """真正开始录制后更新界面,并把「会采到什么」说清楚(#2)."""
+        self._btn_rec.setText("■ 停止录制")
+        self._btn_rec.setStyleSheet("color:#ff7575; font-weight:bold;")
+        scope = (
+            "仅目标窗口在前台期间"
+            if self._target_hwnd else "全系统(未选择目标窗口!)"
+        )
+        self._status.setText(styled_message(
+            f"正在录制:{scope} · 最多 {int(self._REC_MAX_SECONDS)} 秒后自动停止",
+            level="warn"))
+
+    def _begin_recording(self) -> None:
+        """按隐私边界启动录制:优先只采目标窗口前台期间,并预告时长上限(#2)."""
+        target = int(self._target_hwnd or 0)
+        if not target:
+            r = QMessageBox.warning(
+                self, "开始录制",
+                "还没有选择目标窗口。\n\n"
+                "录制用的是系统级键盘/鼠标钩子:不指定目标窗口的话,"
+                "这期间你在**任何程序**里的按键(浏览器登录、密码管理器、聊天)"
+                "都会被记进这个宏,并明文存成 JSON 文件。\n\n"
+                "建议先选中游戏窗口再录。确实要录全系统吗?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if r != QMessageBox.StandardButton.Yes:
+                return
+        max_ev = int(self._REC_MAX_EVENTS)
+        if not self._recorder.start(
+                target, max_seconds=self._REC_MAX_SECONDS, max_events=max_ev):
+            QMessageBox.warning(self, "开始录制", "启动录制失败(见日志)。")
+            return
+        self._start_recorder_ui()
+
+    def _finish_recording(self, script) -> None:
+        """录制结束(手动停或到上限自动停)后的收尾."""
+        self._btn_rec.setText("● 开始录制")
+        self._btn_rec.setStyleSheet("")
+        if script is None:
+            self._rec_status.setText("未录到内容")
+            return
+        self._script = script
+        # 记下录制时目标窗口的客户区尺寸:回放时按「当前尺寸/基准尺寸」
+        # 等比缩放,这样窗口被聚焦铺满或手动缩放后宏依然打在同一个位置。
+        if self._target_hwnd:
+            cw, ch = wf.client_size(self._target_hwnd)
+            if cw > 0 and ch > 0:
+                script.base_w, script.base_h = int(cw), int(ch)
+        base_txt = (f" · 基准 {script.base_w}×{script.base_h}"
+                    if script.base_w and script.base_h else " · 无基准尺寸")
+        keys = sum(1 for e in script.events
+                   if e.type in (MacroEventType.KEY_DOWN.value, MacroEventType.KEY_UP.value))
+        why = self._recorder.limit_reason
+        tail = f" · {why}自动停止" if why else ""
+        self._rec_status.setText(
+            f"已录制: {script.name} · {len(script.events)} 事件 · "
+            f"{script.duration_ms}ms{base_txt}{tail}"
+        )
+        # 保存前把「含多少个按键、会写到哪个占位符路径」说清楚(#2)
+        self._status.setText(styled_message(
+            f"本次录制含 {keys} 个按键事件。保存后会以明文写入宏文件"
+            "(路径形如 %APPDATA%\\AutoFarmStation\\macros\\...),"
+            "请不要把带按键的宏分享给别人。",
+            level="warn"))
+        self._events_list.clear()
+        for e in script.events[:200]:
+            self._events_list.addItem(self._fmt_event(e))
 
     def _fmt_event(self, e: MacroEvent) -> str:
         if e.type == MacroEventType.MOUSE_CLICK.value:
@@ -752,20 +815,33 @@ class RecorderPanel(QWidget):
         if not self._script:
             QMessageBox.information(self, "保存宏", "没有可保存的宏。")
             return
-        path, _ = QFileDialog.getSaveFileName(self, "保存宏", f"{self._script.name}.json",
+        from ..utils.paths import safe_filename
+        from pathlib import Path
+        # 宏名可能来自导入的文件,不能直接当默认文件名用(#10 同类问题)
+        default_name = safe_filename(Path(str(self._script.name or "宏")).name) + ".json"
+        path, _ = QFileDialog.getSaveFileName(self, "保存宏", default_name,
                                               "Macro (*.json)")
         if not path:
             return
         from ..utils.paths import atomic_write
-        atomic_write(__import__('pathlib').Path(path), self._script.to_json())
-        self._status.setText(styled_message("宏已保存", level="ok"))
+        atomic_write(Path(path), self._script.to_json())
+        from ..utils.sanitize import sanitize
+        self._status.setText(styled_message(
+            f"宏已保存:{sanitize(path)}", level="ok"))
 
     def _on_load(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "加载宏", "", "Macro (*.json)")
         if not path:
             return
         try:
-            text = open(path, "r", encoding="utf-8").read()
+            from pathlib import Path as _P
+            src = _P(path)
+            # 先查大小再读:宏 JSON 是被用户手改过的外部输入(#11)
+            size = src.stat().st_size
+            if size > MAX_MACRO_FILE_BYTES:
+                raise ValueError(
+                    f"宏文件过大({size // 1024}KB > {MAX_MACRO_FILE_BYTES // 1024}KB),已拒绝载入")
+            text = src.read_text(encoding="utf-8")
             self._script = MacroScript.from_json(text)
             self._rec_status.setText(
                 f"已加载: {self._script.name} · {len(self._script.events)} 事件"
@@ -801,7 +877,15 @@ class RecorderPanel(QWidget):
 
     def _refresh(self) -> None:
         if self._recorder.is_recording:
-            self._rec_status.setText(f"录制中 · {self._recorder.event_count} 事件")
+            left = int(self._recorder.remaining_sec())
+            keys = self._recorder.key_event_count
+            self._rec_status.setText(
+                f"录制中 · {self._recorder.event_count} 事件(按键 {keys})"
+                f" · {left}s 后自动停止")
+        elif self._btn_rec.text().startswith("■"):
+            # 到时长 / 事件上限被录制器自动停了:界面必须跟上,
+            # 不能还显示「录制中」并把已采到的事件丢掉(#2)
+            self._finish_recording(self._recorder.take_script())
         if self._player and not self._player.is_running and self._status.text().startswith("回放中"):
             self._status.setText(styled_message("回放完成", level="ok"))
 

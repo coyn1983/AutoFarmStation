@@ -33,6 +33,9 @@ MOUSEEVENTF_WHEEL = 0x0800
 MOUSEEVENTF_HWHEEL = 0x01000
 MOUSEEVENTF_ABSOLUTE = 0x8000
 
+# 单次 type_text 的字符上限:超过直接截断,避免外部数据把输入队列灌死(#11)
+MAX_TYPE_TEXT_LEN = 2000
+
 # Keyboard event flags
 KEYEVENTF_EXTENDEDKEY = 0x0001
 KEYEVENTF_KEYUP = 0x0002
@@ -272,6 +275,54 @@ def _send_inputs(inputs: list[INPUT]) -> int:
 
 
 # === 公共入口 ===
+def real_input_allowed() -> bool:
+    """是否允许「真实输入」路径(SendInput)。全局开关,默认开(#4).
+
+    关掉之后 post 失败就只是失败,绝不会把点击/按键打到用户当前正在用的窗口上。
+    """
+    try:
+        from ..utils.config import instance
+        return bool(instance().get("input.allow_real_fallback", True))
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def ensure_foreground(hwnd: int, *, timeout: float = 0.3) -> bool:
+    """把 ``hwnd`` 提到前台并**确认成功**(审计报告 #4).
+
+    ``SetForegroundWindow`` 会被 Windows 的前台锁定策略拒绝,UIPI 也会挡住
+    向提权窗口投递 —— 以前代码忽略返回值就接着 SendInput,结果坐标是游戏
+    客户区的坐标,落点却是用户自己的文档 / 浏览器 / 聊天框。确认失败就返回
+    False,让调用方放弃这次真实输入。
+    """
+    hwnd = int(hwnd or 0)
+    if not hwnd or not wf._is_window(hwnd):
+        return False
+    try:
+        if int(wf.get_foreground_hwnd() or 0) == hwnd:
+            return True
+    except Exception:  # noqa: BLE001
+        return False
+    try:
+        wf.set_foreground(hwnd)
+    except Exception:  # noqa: BLE001
+        pass
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            if int(wf.get_foreground_hwnd() or 0) == hwnd:
+                return True
+        except Exception:  # noqa: BLE001
+            return False
+        time.sleep(0.02)
+    # 前台锁定时 SetForegroundWindow 会静默失败,退一步用绕锁方案再确认一次
+    try:
+        wf.force_foreground(hwnd)
+        return int(wf.get_foreground_hwnd() or 0) == hwnd
+    except Exception:  # noqa: BLE001
+        return False
+
+
 class InputSender:
     """对外的高级输入发送器."""
 
@@ -279,6 +330,14 @@ class InputSender:
         """default_mode: 'auto' (默认)= 先后台投递,失败改真实输入;
         'post' = 仅后台投递;'send' = 直接真实输入。"""
         self.default_mode = default_mode if default_mode in ("auto", "post", "send") else "auto"
+        # True 时即使提不到前台也照发 SendInput(旧行为)。默认 False:
+        # 确认不了前台就不发,避免误打到用户的当前窗口(#4)。
+        try:
+            from ..utils.config import instance
+            self.require_foreground = bool(
+                instance().get("input.require_foreground", True))
+        except Exception:  # noqa: BLE001
+            self.require_foreground = True
 
     # --- 模式 ---
     def click(
@@ -311,7 +370,25 @@ class InputSender:
             x, y = cw // 2, ch // 2
         else:
             hwnd, x, y = int(target[0]), int(target[1]), int(target[2])
-            ox, oy = wf.client_origin(hwnd)
+            ox, oy = wf.client_origin(hwnd) if hwnd else (0, 0)
+
+        if not hwnd:
+            # hwnd=0 = 「绝对屏幕坐标」回放(宏的 absolute 模式):没有可投递的
+            # 目标窗口,只能走真实输入,因此**只允许显式 send 模式**,并且
+            # 受「禁用真实输入」总开关约束(#4)。
+            if m != "send":
+                return (False, "没有目标窗口:绝对坐标输入需要显式 send 模式")
+            if not real_input_allowed():
+                return (False, "真实输入已在设置里关闭")
+            try:
+                _InputHelper.click_at(x, y, button)
+                if double:
+                    _InputHelper.click_at(x, y, button)
+                return (True, "")
+            except Exception as e:
+                return (False, f"send 失败:{e}")
+        if not wf._is_window(hwnd):
+            return (False, "目标窗口无效,已拒绝发送输入")
 
         if m in ("post", "auto"):
             ok = wf.post_click(hwnd, x, y, button.value, double=double)
@@ -320,9 +397,16 @@ class InputSender:
             if m == "post":
                 return (False, "post 返回 0(目标未响应消息,可能是独占全屏或 UAC 隔离)")
 
-        # send 模式 / auto 回退
+        # send 模式 / auto 回退:确认目标窗口真的在前台了才发真实输入(#4)
+        if not real_input_allowed():
+            return (False, "真实输入已被设置里关闭,post 未生效;请改用 post 模式或重新聚焦窗口")
+        if self.require_foreground and not ensure_foreground(hwnd):
+            return (
+                False,
+                "无法把目标窗口提到前台(前台锁定 / 提权窗口 / UAC 隔离),"
+                "已放弃真实输入 —— 否则这一枪会打在您当前正在用的窗口上",
+            )
         try:
-            wf.set_foreground(hwnd)
             time.sleep(0.02)
             sx, sy = ox + x, oy + y
             _InputHelper.click_at(sx, sy, button)
@@ -338,59 +422,118 @@ class InputSender:
         target: tuple[int, int, int],
         *,
         mode: str | None = None,
-    ) -> bool:
-        """移动鼠标到客户区坐标."""
-        hwnd, x, y = target
-        m = mode or self.default_mode
+    ) -> tuple[bool, str]:
+        """移动鼠标到客户区坐标;确认不了前台就不动光标(#4)."""
+        hwnd, x, y = int(target[0]), int(target[1]), int(target[2])
+        m = (mode or self.default_mode).lower()
+        if m not in ("auto", "post", "send"):
+            m = "auto"
         if m == "post":
-            return wf.post_mouse_move(hwnd, int(x), int(y))
+            if not hwnd:
+                return (False, "post 模式需要目标窗口")
+            return (wf.post_mouse_move(hwnd, x, y), "")
+        if not real_input_allowed():
+            return (False, "真实输入已关闭")
+        if not hwnd:
+            # 绝对屏幕坐标(宏 absolute 模式):无窗口可校验,只允许显式 send
+            if m != "send":
+                return (False, "没有目标窗口:绝对坐标移动需要显式 send 模式")
+            _InputHelper.move_abs(x, y)
+            return (True, "")
+        if not wf._is_window(hwnd):
+            return (False, "目标窗口无效")
+        if self.require_foreground and not ensure_foreground(hwnd):
+            return (False, "无法确认目标窗口在前台,已放弃移动光标")
         ox, oy = wf.client_origin(hwnd)
-        wf.set_foreground(hwnd)
         time.sleep(0.005)
-        _InputHelper.move_abs(ox + int(x), oy + int(y))
-        return True
+        _InputHelper.move_abs(ox + x, oy + y)
+        return (True, "")
 
     def key_down(self, vk: int, *, hwnd: int | None = None, mode: str | None = None) -> bool:
-        m = mode or self.default_mode
+        m = (mode or self.default_mode).lower()
         if m == "post" and hwnd is not None:
             return wf.post_key(hwnd, vk, down=True)
+        if not self._allow_real_key(hwnd, m):
+            return False
         _InputHelper.key_down(vk)
         return True
 
     def key_up(self, vk: int, *, hwnd: int | None = None, mode: str | None = None) -> bool:
-        m = mode or self.default_mode
+        m = (mode or self.default_mode).lower()
         if m == "post" and hwnd is not None:
             return wf.post_key(hwnd, vk, down=False)
+        if not self._allow_real_key(hwnd, m):
+            return False
         _InputHelper.key_up(vk)
         return True
 
     def key_press(self, vk: int, *, hwnd: int | None = None, hold_ms: int = 30, mode: str | None = None) -> bool:
-        m = mode or self.default_mode
+        m = (mode or self.default_mode).lower()
         if m == "post" and hwnd is not None:
             self.key_down(vk, hwnd=hwnd, mode=m)
-            time.sleep(max(0, hold_ms) / 1000.0)
+            time.sleep(max(0, min(60_000, hold_ms)) / 1000.0)
             self.key_up(vk, hwnd=hwnd, mode=m)
             return True
+        if not self._allow_real_key(hwnd, m):
+            return False
         _InputHelper.key_press(vk, hold_ms=hold_ms)
         return True
 
     def type_text(self, text: str, *, hwnd: int | None = None, mode: str | None = None) -> bool:
         """输入纯文本(键盘事件)."""
-        m = mode or self.default_mode
-        for ch in text:
+        m = (mode or self.default_mode).lower()
+        if not self._allow_real_key(hwnd, m) and m != "post":
+            return False
+        if not text:
+            return True
+        for ch in text[:MAX_TYPE_TEXT_LEN]:
             if m == "post" and hwnd is not None:
                 wf.post_key(hwnd, ord(ch.upper()) & 0xFF, down=True)
                 wf.post_key(hwnd, ord(ch.upper()) & 0xFF, down=False)
             else:
                 _InputHelper.key_press(ord(ch.upper()) & 0xFF)
-        return True
+        return len(text) <= MAX_TYPE_TEXT_LEN
+
+    def _allow_real_key(self, hwnd: int | None, mode: str) -> bool:
+        """真实按键前的三道闸:开关开着 / 有目标窗口 / 前台确认得了(#4).
+
+        ``hwnd`` 为空(None 或 0)时旧代码会直接 SendInput —— 按键就落到用户此刻
+        正在用的窗口上。现在只有显式 ``mode='send'``(宏的 absolute 回放)才允许。
+        """
+        if mode == "post":
+            # post 模式却没有可用的 hwnd:没有投递目标,只能拒绝
+            return False
+        if not real_input_allowed():
+            return False
+        h = int(hwnd or 0)
+        if not h:
+            return mode == "send"
+        if not wf._is_window(h):
+            return False
+        return (not self.require_foreground) or ensure_foreground(h)
 
     def scroll(self, delta: int, *, hwnd: int | None = None, mode: str | None = None) -> bool:
-        """滚轮."""
-        m = mode or self.default_mode
-        if m == "post" and hwnd is not None:
-            # 滚轮 PostMessage 比较麻烦,这里简化用 send
-            wf.set_foreground(hwnd)
-            time.sleep(0.01)
+        """滚轮:有目标窗口时走 WM_MOUSEWHEEL 后台投递,不再抢前台发真实滚轮(#4)."""
+        m = (mode or self.default_mode).lower()
+        if m not in ("auto", "post", "send"):
+            m = "auto"
+        delta = int(max(-14400, min(14400, delta)))
+        h = int(hwnd or 0)
+        if h and m in ("post", "auto"):
+            ox, oy = wf.client_origin(h)
+            cw, ch = wf.client_size(h)
+            if wf.post_scroll(h, delta, ox + cw // 2, oy + ch // 2):
+                return True
+            if m == "post":
+                return False
+        if not real_input_allowed():
+            return False
+        if not h:
+            # 没有目标窗口的真实滚轮只接受显式 send(宏 absolute 回放)
+            if m != "send":
+                return False
+        elif self.require_foreground and not ensure_foreground(h):
+            return False
+        time.sleep(0.01)
         _InputHelper.scroll(delta)
         return True

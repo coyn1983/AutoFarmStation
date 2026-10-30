@@ -251,6 +251,14 @@ def detect_launch_info(pid: int, *, title: str = "") -> LaunchInfo | None:
 
     appid = _appid_from_environ(proc) or find_appid_by_exe(exe)
     source = "steam" if appid else ("exe" if exe else "")
+    if exe:
+        # 把游戏安装目录登记进脱敏表:README 承诺「不含游戏安装绝对路径」,
+        # 而这类路径没法靠通用正则识别(#14)。
+        try:
+            from ..utils.sanitize import register_sensitive_prefix
+            register_sensitive_prefix(str(Path(exe).parent))
+        except Exception:  # noqa: BLE001
+            pass
     return LaunchInfo(
         exe=exe,
         args=args,
@@ -275,13 +283,69 @@ def is_process_alive(pid: int) -> bool:
         return False
 
 
+def process_identity(pid: int) -> tuple[float, str]:
+    """返回 (create_time, 小写镜像名);拿不到时是 (0.0, '').
+
+    给 kill_process 做身份校验用:PID 会被 Windows 回收重用,长时间挂机后
+    记下来的 pid 很可能已经属于另一个进程(#12)。
+    """
+    if not pid:
+        return 0.0, ""
+    try:
+        import psutil  # type: ignore
+
+        proc = psutil.Process(int(pid))
+        try:
+            name = str(proc.name() or "").lower()
+        except Exception:  # noqa: BLE001
+            name = ""
+        try:
+            return float(proc.create_time()), name
+        except Exception:  # noqa: BLE001
+            return 0.0, name
+    except Exception:  # noqa: BLE001
+        return 0.0, ""
+
+
+def identity_matches(
+    pid: int, *, expect_name: str = "", expect_create_time: float = 0.0
+) -> tuple[bool, str]:
+    """当前 pid 是否仍是「当初记下的那个进程」(#12).
+
+    只给了名字时按名字比;给了 create_time 时按 create_time(±1s 容差,
+    不同 API 的精度/取整不一样)为主、名字为辅。两者都没给 → 视为通过,
+    由调用方自己承担风险。
+    """
+    if not expect_name and not expect_create_time:
+        return True, ""
+    live_ct, live_name = process_identity(pid)
+    if live_ct == 0.0 and not live_name:
+        return False, "进程已不存在或无法读取身份信息"
+    if expect_create_time:
+        if abs(live_ct - float(expect_create_time)) > 1.0:
+            return False, (
+                f"PID {pid} 已被复用(创建时间不符),当前是 {live_name or '未知进程'}"
+            )
+    if expect_name and live_name and live_name != expect_name.lower():
+        return False, f"PID {pid} 当前的进程名是 {live_name},不是 {expect_name}"
+    return True, ""
+
+
 def kill_process(
     pid: int,
     *,
     tree: bool = True,
     timeout: float = 6.0,
+    expect_name: str = "",
+    expect_create_time: float = 0.0,
+    verify_identity: bool = True,
 ) -> tuple[bool, str]:
-    """结束进程(默认连同子进程).返回 (成功?, 描述)."""
+    """结束进程(默认连同子进程).返回 (成功?, 描述).
+
+    ``verify_identity`` 为 True 且给了 ``expect_name`` / ``expect_create_time``
+    时,动手前必须确认这个 pid 还是当初那个进程 —— 否则会连带杀掉被复用后的
+    无辜进程树,甚至系统进程(#12)。
+    """
     if not pid:
         return False, "没有 pid"
     try:
@@ -292,6 +356,12 @@ def kill_process(
         proc = psutil.Process(int(pid))
     except Exception:  # noqa: BLE001
         return True, "进程已不在"
+
+    if verify_identity and (expect_name or expect_create_time):
+        ok, why = identity_matches(
+            pid, expect_name=expect_name, expect_create_time=expect_create_time)
+        if not ok:
+            return False, f"已拒绝结束:{why}"
 
     targets: list = []
     if tree:

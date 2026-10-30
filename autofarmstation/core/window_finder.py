@@ -402,6 +402,8 @@ WM_MBUTTONDOWN = 0x0207
 WM_MBUTTONUP = 0x0208
 WM_MOUSEMOVE = 0x0200
 WM_LBUTTONDBLCLK = 0x0203
+WM_MOUSEWHEEL = 0x020A
+WM_MOUSEHWHEEL = 0x020E
 WM_KEYDOWN = 0x0100
 WM_KEYUP = 0x0101
 WM_CHAR = 0x0102
@@ -439,6 +441,20 @@ def post_click(hwnd: int, x: int, y: int, button: str = "left", double: bool = F
 def post_mouse_move(hwnd: int, x: int, y: int) -> bool:
     """发送鼠标移动消息."""
     return bool(_user32.PostMessageW(hwnd, WM_MOUSEMOVE, 0, _makelparam(x, y)))
+
+
+def post_scroll(
+    hwnd: int, delta: int, x: int = 0, y: int = 0, *, horizontal: bool = False
+) -> bool:
+    """后台投递滚轮消息(WM_MOUSEWHEEL / WM_MOUSEHWHEEL),不抢前台(#4).
+
+    WPARAM 低 16 位是按键状态(滚轮恒为 0),高 16 位是**有符号**滚轮增量
+    (一格 = 120);LPARAM 是客户区坐标。负数按 16 位补码放进高位。
+    """
+    d = max(-14400, min(14400, int(delta)))
+    wparam = (d & 0xFFFF) << 16
+    msg = WM_MOUSEHWHEEL if horizontal else WM_MOUSEWHEEL
+    return bool(_user32.PostMessageW(hwnd, msg, wparam, _makelparam(x, y)))
 
 
 def post_key(hwnd: int, vk: int, *, down: bool = True) -> bool:
